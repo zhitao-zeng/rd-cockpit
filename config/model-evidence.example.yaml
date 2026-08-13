@@ -1,0 +1,12 @@
+version: 1
+sources:
+  example_model_official:
+    label: Example model documentation
+    url: https://example.com/model
+    source_type: official_docs
+    scope: family_reference
+    retrieved_at: 2026-01-01
+    projects: [speech_research]
+    model_aliases: [ExampleModel]
+    facts:
+      - Replace this sentence with a short paraphrase supported by the primary source.

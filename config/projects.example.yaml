@@ -1,0 +1,17 @@
+projects:
+  speech_research:
+    name: Speech Research
+    repo_path: /absolute/path/to/your/repository
+    priority: P1
+    lifecycle_status: active
+    match_keywords:
+      - speech recognition
+      - ASR
+    verification_stages:
+      - implementation
+      - unit_test
+      - local_eval
+      - deployment
+
+machine: local
+machines: {}

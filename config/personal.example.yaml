@@ -1,0 +1,17 @@
+# 复制为 config/personal.yaml 后填写。personal.yaml 只保存在本地，不进入 Git。
+profile:
+  employment_start: null
+  payday_day: last
+  annual_leave_total: null
+  annual_leave_used: null
+  annual_leave_remaining: null
+  anniversaries: []
+
+project_start_dates: {}
+
+holidays:
+  region: CN
+  custom: []
+
+fun:
+  token_per_book: 100000

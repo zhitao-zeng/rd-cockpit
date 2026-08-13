@@ -1,0 +1,4 @@
+interface:
+  display_name: "Daily Report"
+  short_description: "Generate an evidence-audited research daily report"
+  default_prompt: "Use $daily-report to generate today’s evidence-audited research report."

@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  /* Linear 风浅灰：干净、低饱和度，状态色保持 ≥3:1 对比度 */
+  --color-page: #fafafa;
+  --color-card: #ffffff;
+  --color-cardhover: #f1f1ef;
+  --color-line: #e5e5e0;
+  --color-ink: #1a1a1a;
+  --color-ink2: #6b6b66;
+  --color-ink3: #a8a8a0;
+
+  --color-primary: #5a50e0;
+  --color-passed: #2f9e5f;
+  --color-warning: #c78a1b;
+  --color-critical: #d4433a;
+
+  /* categorical（CVD 安全，固定顺序使用） */
+  --color-cat1: #3a72c8;
+  --color-cat2: #c25a2a;
+  --color-cat3: #7a5cc8;
+  --color-cat4: #c04a7a;
+
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html,
+body {
+  background-color: var(--color-page);
+  color: var(--color-ink);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* ECharts tooltip 等弹出层在深色下保持可读 */
+.echarts-tooltip {
+  z-index: 50;
+}
+
+/* 细滚动条，信息密度高时不抢眼 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

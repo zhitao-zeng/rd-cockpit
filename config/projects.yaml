@@ -1,0 +1,6 @@
+# Anonymous starter registry. Add your repositories with `rd project add`.
+# Keep real paths in config/projects.local.yaml; local files are ignored by Git.
+projects: {}
+
+machine: local
+machines: {}
