@@ -8,7 +8,12 @@ def _write(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-def test_daily_supplement_attributes_sessions_tokens_git_and_files(tmp_path: Path) -> None:
+def test_daily_supplement_attributes_sessions_tokens_git_and_files(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "projects.yaml"
+    config.write_text("projects: {}\n", encoding="utf-8")
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
     data = tmp_path / "data"
     data.mkdir()
     _write(data / "2026-08-01_codex_sessions.json", {
@@ -38,7 +43,7 @@ def test_daily_supplement_attributes_sessions_tokens_git_and_files(tmp_path: Pat
     assert result["totals"]["tokens"] == 1000
     assert result["coverage"]["token_attribution_ratio"] == 1.0
     assert result["projects"] == [{
-        "project_id": "asr", "name": "Embodied AI / ASR", "sessions": 1, "claude_sessions": 0,
+        "project_id": "asr", "name": "ASR", "sessions": 1, "claude_sessions": 0,
         "codex_sessions": 1, "requests": 3, "tool_calls": 12, "duration_minutes": 20.0,
         "tokens": 1000, "claude_tokens": 0, "codex_tokens": 1000,
         "commits": 2, "changed_files": 1,

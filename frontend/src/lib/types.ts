@@ -36,36 +36,6 @@ export interface ProjectState {
   recent_events: RecentEvent[];
 }
 
-export interface TimelineEvent {
-  event_id: string;
-  occurred_at: string;
-  type: string;
-  status: string | null;
-  source: string | null;
-  commit: string | null;
-  provenance: string | null;
-  payload: Record<string, unknown>;
-  evidence: Array<Record<string, unknown>>;
-}
-
-export interface Anomaly {
-  level: string; // info | warning | critical
-  code: string;
-  project_id: string | null;
-  message: string;
-  evidence: Array<string | null>;
-}
-
-export interface SessionInfo {
-  session_id: string;
-  project_id: string | null;
-  started_at: string | null;
-  ended_at: string | null;
-  status: string;
-  goal: string | null;
-  handoff: Record<string, unknown>;
-}
-
 export interface TrendPoint {
   date: string;
   events: number;
@@ -110,529 +80,17 @@ export interface StatsFacts {
   events: StatsEvent[];
 }
 
-export interface SemanticItem {
-  kind: string;
-  text: string;
-  status: string | null;
-  project_id: string | null;
-  evidence: string[];
-  confidence: string;
-}
-
-export interface SemanticBlocker {
-  project_id: string | null;
-  text: string;
-  confidence: string;
-  evidence?: string[];
-}
-
-export interface SemanticNextAction {
-  project_id: string | null;
-  action: string;
-  reason: string;
-  basis: unknown[];
-}
-
-export interface SemanticFacts {
-  generator: string;
-  target_date: string;
-  today_results: SemanticItem[];
-  yesterday_plan_closure: Array<Record<string, unknown>>;
-  current_blockers: SemanticBlocker[];
-  next_actions: SemanticNextAction[];
-  anomalies: Anomaly[];
-}
-
-export interface DailyReport {
-  schema_version: number;
-  report_date: string;
-  generated_at: string;
-  summary: {
-    events: number;
-    event_types: Record<string, number>;
-    tests: { passed: number; failed: number };
-    projects: Record<string, { events: number; types: Record<string, number>; commits: string[]; results: unknown[] }>;
-    resource_anomalies: Array<Record<string, unknown>>;
-    plans: Array<Record<string, unknown>>;
-    highlights: Array<Record<string, unknown>>;
-    time: Record<string, unknown>;
-    anomalies?: Anomaly[];
-  };
-  events: Array<Record<string, unknown>>;
-  semantic?: SemanticFacts;
-}
-
-export interface TwinProject {
-  project_id: string;
-  goal: string | null;
-  verification: Record<string, StageInfo>;
-  blockers: string[];
-  remaining: string[];
-  head: string | null;
-  dirty: boolean | null;
-  evidence_coverage: number;
-}
-
-export interface DigitalTwin {
-  generated_from: string;
-  projects: TwinProject[];
-}
-
-export interface GpuInfo {
-  gpu: string;
-  samples: number;
-  avg_utilization_pct: number;
-  peak_memory_mb: number;
-  idle_allocated_samples: number;
-  evidence: string[];
-}
-
-export interface GpuReport {
-  samples: number;
-  gpus: GpuInfo[];
-  note: string;
-}
-
-export interface MapProject {
-  project_id: string;
-  progress: number;
-  risk: Record<string, string>;
-  status: string; // blocked | active | done
-  bubble: number;
-}
-
-export interface HealthInfo {
-  project_id: string;
-  score: number;
-  dimensions: {
-    evidence: number;
-    reproducibility: number;
-    verification: number;
-    blockers: number;
-  };
-  basis: unknown[];
-}
-
-export interface RiskRadar {
-  project_id: string;
-  risks: Record<string, string>; // correctness/progress/reproducibility/resource → high|medium|low|unknown
-  confidence: string;
-  basis: unknown[];
-}
-
-export interface EfficiencyItem {
-  event_id: string;
-  name: string | null;
-  classification: string;
-  status: string | null;
-  project_id: string | null;
-  evidence: string[];
-}
-
-export interface ExperimentEfficiency {
-  total: number;
-  counts: Record<string, number>;
-  effective_rate: number;
-  items: EfficiencyItem[];
-}
-
-export interface ReproItem {
-  event_id: string;
-  project_id: string | null;
-  score: number;
-  checks: Record<string, boolean>;
-  missing: string[];
-}
-
-export interface Fingerprint {
-  fingerprint: string;
-  count: number;
-  duplicate: boolean;
-  experiments: Array<{ event_id: string; name: string | null; status: string | null }>;
-}
-
-export interface InfoGainItem {
-  event_id: string;
-  fingerprint: string;
-  information_gain: number;
-  classification: string; // high | low
-  similar_to: string | null;
-  evidence: string[];
-}
-
-export interface Hypothesis {
-  hypothesis_id: string;
-  statement: string | null;
-  scope: unknown;
-  events: Array<{ event_id: string; type: string; status: string | null; evidence: string[] }>;
-  status: string;
-}
-
-export interface ConfidenceItem {
-  event_id: string;
-  project_id: string | null;
-  score: number;
-  claim: string | null;
-  reasons: string[];
-  confidence: string; // observed | partial
-}
-
-export interface FreshnessItem {
-  event_id: string;
-  project_id: string | null;
-  text: string | null;
-  status: string;
-  reasons: string[];
-  evidence: string[];
-}
-
-export interface DecisionConflict {
-  decision_key: string;
-  possible_conflict: boolean;
-  different_scope: boolean;
-  decisions: Array<{
-    event_id: string;
-    occurred_at: string;
-    status: string | null;
-    payload: Record<string, unknown>;
-    evidence: string[];
-  }>;
-  recommendation: string;
-}
-
-export interface GraphNode {
-  id: string;
-  type: string;
-  label: string;
-  status?: string | null;
-  event_id?: string;
-  name?: string;
-  value?: unknown;
-}
-
-export interface GraphEdge {
-  from: string;
-  to: string;
-  relation: string;
-  evidence: string[];
-}
-
-export interface DecisionGraph {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-}
-
-export interface ParamHistoryItem {
-  value: unknown;
-  occurred_at: string;
-  event_id: string;
-  type: string;
-  project_id: string | null;
-  commit: string | null;
-  status: string | null;
-  reason: string | null;
-  evidence: string[];
-}
-
-export interface ParamLineage {
-  parameter: string;
-  history: ParamHistoryItem[];
-  current: unknown;
-  changed: boolean;
-}
-
-export interface Suggestion {
-  project_id: string | null;
-  suggestion: string;
-  reason: string;
-  basis: unknown[];
-  kind: string;
-}
-
-export interface Counterfactual {
-  query: string;
-  answer: string;
-  confidence: string;
-  evidence: string[];
-  observed_decision?: Record<string, unknown>;
-  alternative_observations?: Array<Record<string, unknown>>;
-}
-
-export interface ChangedEvent {
-  event_id: string;
-  occurred_at: string;
-  project_id: string | null;
-  type: string;
-  status: string | null;
-  commit: string | null;
-  payload: Record<string, unknown>;
-  evidence: string[];
-}
-
-export interface WhatChanged {
-  query: string;
-  counts: Record<string, number>;
-  events: ChangedEvent[];
-}
-
-export interface ResourceSnapshotGpu {
-  index?: number | string;
-  utilization_pct?: number | string;
-  memory_used_mb?: number | string;
-  name?: string;
-}
-
-export interface ResourceSnapshotPayload {
-  sampled_at?: string;
-  gpus?: ResourceSnapshotGpu[];
-  containers?: Array<Record<string, unknown>>;
-  docker_error?: string | null;
-}
-
-export interface ResourceCostItem {
-  decision_id: string;
-  project_id: string | null;
-  resource_samples: number;
-  gpu_observed: string[];
-  cost_is_approximate: boolean;
-  evidence: string[];
-}
-
-export interface BudgetRoi {
-  experiments: number;
-  useful_experiments: number;
-  gpu_observations: number;
-  gpu_hours: number | null;
-  unit_cost: string | null;
-  confidence: string;
-  basis: string[];
-}
-
-export interface DebtItem {
-  project_id: string;
-  category: string;
-  severity: string;
-  text: string | null;
-  evidence: Array<string | null | undefined>;
-}
-
-export interface ResearchDebt {
-  total: number;
-  by_category: Record<string, number>;
-  high_risk: number;
-  items: DebtItem[];
-}
-
-export interface WhyNotDone {
-  project_id: string;
-  primary_reasons: Array<{ priority: number; reason: string; evidence: Array<string | null | undefined> }>;
-  completed: string[];
-}
-
-export interface ContextPackData {
-  project: ProjectState;
-  recent_events: RecentEvent[];
-  decisions: Array<{ event_id: string; type: string; payload: Record<string, unknown> }>;
-  parameter_lineage: ParamLineage[];
-  reproducibility: ReproItem[];
-}
-
-export interface ReplayItem {
-  at: string;
-  project_id: string | null;
-  type: string;
-  status: string | null;
-  detail: string;
-  evidence: string[];
-}
-
-export interface TodayReplay {
-  date: string;
-  summary: SemanticFacts;
-  timeline: ReplayItem[];
-}
-
-export interface ResearchWrapped {
-  period: string;
-  most_active_project: string | null;
-  outputs: StatsFacts["outputs"];
-  time: StatsFacts["time"];
-  trend: TrendPoint[];
-  failed_events: number;
-  rejected_or_superseded_decisions: number;
-  basis: string[];
-}
-
-export interface DailyCard {
-  date: string;
-  mainline: SemanticItem[];
-  results: SemanticItem[];
-  blockers: SemanticBlocker[];
-  next: SemanticNextAction[];
-  evidence: Array<string | undefined>;
-}
-
-export interface SessionEfficiencyItem {
-  session_id: string;
-  project_id: string | null;
-  started_at: string | null;
-  ended_at: string | null;
-  status: string;
-  events: number;
-  tests: number;
-  failures: number;
-  first_effective_at: string | null;
-  duration_hours: number | null;
-  evidence: string[];
-}
-
-export interface SwitchAnalysis {
-  switches: number;
-  sequence: string[];
-  events: Array<{ from: string; to: string; occurred_at: string; event_id: string }>;
-  basis: string[];
-}
-
-export interface Coverage {
-  total_claims: number;
-  covered_claims: number;
-  coverage: number;
-  claims_without_evidence: string[];
-}
-
-export interface ImpactStage {
-  stage: string;
-  status: string;
-  reason?: string | null;
-  basis: Array<string | null | undefined>;
-}
-
-export interface ChangeImpact {
-  project_id: string;
-  head: string | null;
-  dirty: boolean | null;
-  stages: ImpactStage[];
-  recommendation: string;
-}
-
-export interface AttentionBudget {
-  event_proxy: Record<string, number>;
-  shares: Record<string, number>;
-  note: string;
-}
-
-export interface Rhythm {
-  hours: Array<{ hour: number; events: number; success?: number; failure?: number }>;
-  note: string;
-}
-
-export interface HandoffQualityItem {
-  session_id: string;
-  score: number;
-  fields: Record<string, boolean>;
-  evidence: string[];
-}
-
-export interface AgentBlindspot {
-  agent: string;
-  sessions: number;
-  possible_remote_verification_omissions: number;
-  confidence: string;
-}
-
-export interface MemoryFreshness {
-  project_id: string;
-  score: number;
-  age_days: number | null;
-  stale_stages: string[];
-  confidence: string;
-}
-
-export interface KnowledgeCard {
-  title: string;
-  experience: string | null;
-  scope: unknown;
-  status: string | null;
-  source: string[];
-  confidence: string;
-}
-
-export interface Achievement {
-  achievement: string;
-  project_id: string;
-  evidence?: unknown[];
-}
-
-export interface CountdownItem {
-  decision_id: string;
-  waiting_days: number;
-  dependent_events: number;
-  cost: string;
-  evidence: string[];
-}
-
-export interface DontItem {
-  project_id: string | null;
-  dont: string;
-  reason: string;
-  basis: unknown[];
-}
-
-export interface ProjectBrief {
-  generated_at: string;
-  project: ProjectState;
-  health: HealthInfo;
-  risks: RiskRadar;
-  parameters: ParamLineage[];
-  knowledge_cards: KnowledgeCard[];
-}
-
 export interface HealthOk {
   ok: boolean;
-  home: string;
-  database: string;
+  home?: string;
+  database?: string;
 }
 
-// ---------- 简化研究记录视图 ----------
-
-export interface SimpleAgentUsage {
-  sessions: number;
-  input_tokens: number;
-  output_tokens: number;
-  cached_tokens: number;
-  reasoning_tokens: number;
-  total_tokens: number;
-}
-
-export interface SimpleUsage {
-  available: boolean;
-  agents: Record<string, SimpleAgentUsage>;
-  total_tokens: number;
-  note: string | null;
-}
-
-export interface SimpleDailyRecord {
-  date: string;
+export interface ProjectSummary {
   project_id: string;
-  project_name: string;
-  goal: string | null;
-  work: string[];
-  results: string[];
-  problems: string[];
-  next: string[];
-  usage: SimpleUsage;
-  has_activity: boolean;
-  source_count: number;
+  name: string;
+  lifecycle_status?: "active" | "dormant" | "historical";
 }
-
-export interface SimpleDailyResponse {
-  date: string;
-  records: SimpleDailyRecord[];
-  unassigned_usage: SimpleUsage;
-  unassigned_work: string[];
-  explanation: string;
-}
-
 export interface SimpleAnalyticsPoint {
   date: string;
   project_id: string;
@@ -656,6 +114,12 @@ export interface SimpleAnalyticsResponse {
   };
   token_available: boolean;
   token_note: string | null;
+  agent_activity: {
+    totals: { completed: number; failed: number; duration_minutes: number; sessions: number };
+    daily: Array<{ date: string; completed: number; failed: number; duration_minutes: number; sessions: number }>;
+    projects: Array<{ project_id: string; name: string; completed: number; failed: number; duration_minutes: number; sessions: number }>;
+    explanation: string;
+  };
 }
 
 export interface SimpleKnowledgeItem {
@@ -824,8 +288,8 @@ export interface ResearchRadarItem {
 
 export interface ResearchRadarResponse {
   schema_version: number;
-  generated_at: string;
-  expires_at: string;
+  generated_at: string | null;
+  expires_at: string | null;
   source: string;
   source_url: string;
   lookback_days: number;
@@ -1016,6 +480,62 @@ export interface DevelopmentResponse {
   explanation: string;
 }
 
+export interface DevelopmentSummaryResponse {
+  generated_for: string;
+  days: number;
+  source: string;
+  report_count: number;
+  project_names: Record<string, string>;
+  lifecycles: DevelopmentLifecycle[];
+  effort_output: DevelopmentEffort[];
+  activity: DevelopmentResponse["activity"];
+  counts: { nodes: number; projects: number; metrics: number; plans: number };
+  project_identity: { registered: number; unmapped_ids: string[] };
+  explanation: string;
+}
+
+export interface DevelopmentProjectResponse {
+  generated_for: string;
+  days: number;
+  project_id: string;
+  project_name: string;
+  storyline: DevelopmentTaskNode[];
+  timeline_total: number;
+  timeline_limit: number;
+  threads: DevelopmentThread[];
+  metrics: DevelopmentMetric[];
+  lifecycle: DevelopmentLifecycle | null;
+  effort: DevelopmentEffort | null;
+  activity: DevelopmentResponse["activity"];
+  latest_snapshot: { date: string; project: DevelopmentSnapshotProject } | null;
+  explanation: string;
+}
+
+export interface DevelopmentGlobalResponse {
+  generated_for: string;
+  days: number;
+  plans: DevelopmentResponse["plans"];
+  explanation: string;
+}
+
+export interface DevelopmentTimelineResponse {
+  project_id: string | null;
+  offset: number;
+  limit: number;
+  total: number;
+  has_more: boolean;
+  items: DevelopmentTaskNode[];
+}
+
+export interface DevelopmentHistoryResponse {
+  offset: number;
+  limit: number;
+  total: number;
+  has_more: boolean;
+  items: Array<{ date: string; projects: Array<Pick<DevelopmentSnapshotProject,
+    "project_id" | "name" | "phase" | "latest_task" | "latest_result" | "blockers">> }>;
+}
+
 // ---------- 项目情报 ----------
 
 export interface IntelligencePulse {
@@ -1030,7 +550,7 @@ export interface IntelligencePulse {
   last_meaningful: string;
   tokens: number;
   result_items: number;
-  source_mode: "audited" | "historical_audited" | "historical_fallback" | "empty";
+  source_mode: "audited" | "historical_audited" | "historical_fallback" | "stale_last_good" | "empty";
 }
 
 export interface IntelligenceUnknown {
@@ -1087,6 +607,7 @@ export interface IntelligenceDetail {
     summary: string;
     source_mode: string;
     evidence: string[];
+    source_dates?: string[];
   };
 }
 
@@ -1116,12 +637,31 @@ export interface ProjectIntelligenceResponse {
   audit_coverage: {
     report_count: number;
     audited_count: number;
+    stale_last_good_count: number;
     fallback_count: number;
     failed_dates: string[];
     last_audited_date: string | null;
   };
   data_quality: string[];
   explanation: string;
+}
+
+export type SemanticFeedbackRating = "accurate" | "noise" | "incorrect" | "wrong_project" | "missing";
+
+export interface SemanticFeedbackInput {
+  view: string;
+  item_id: string;
+  project_id: string;
+  rating: SemanticFeedbackRating;
+  text: string;
+  source_dates: string[];
+  comment?: string;
+  corrected_project_id?: string;
+}
+
+export interface SemanticFeedback extends SemanticFeedbackInput {
+  event_id: string;
+  occurred_at?: string;
 }
 
 // ---------- 算法架构快照（离线 Codex 审计，页面只读） ----------
@@ -1462,4 +1002,23 @@ export interface ProjectDiscoveryResponse {
   };
   candidates: ProjectDiscoveryCandidate[];
   model_policy: { reviewer: string; fallback: null; registry_write: string };
+}
+
+export interface BackgroundTaskStage {
+  state: "running" | "ok" | "failed" | "skipped";
+  started_at?: string | null;
+  finished_at?: string | null;
+  message?: string;
+}
+
+export interface BackgroundTaskStatus {
+  schema_version: number;
+  updated_at: string | null;
+  stages: Record<string, BackgroundTaskStage>;
+  model_tools: Record<string, { command: string; path: string; available: boolean }>;
+  model_activity?: {
+    counts: { model_calls?: number; cache_hits?: number; deferred?: number; failed?: number; fallbacks?: number };
+    tokens: { total?: number; input?: number; output?: number; cached?: number };
+    duration_ms: number;
+  };
 }

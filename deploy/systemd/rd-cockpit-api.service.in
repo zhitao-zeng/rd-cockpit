@@ -1,0 +1,14 @@
+[Unit]
+Description=R&D Cockpit read-only API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+EnvironmentFile=-%h/.config/rd-cockpit/env
+ExecStart=@PYTHON@ -m rd_cockpit --home @ROOT@ serve --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

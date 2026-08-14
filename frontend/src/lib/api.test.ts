@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, __testables, getProjectIntelligence, getStats, getProjectState } from "./api";
+import {
+  ApiError, __testables, getProjectIntelligence, getStats, getProjectState, setApiToken,
+  recordSemanticFeedback,
+} from "./api";
 
 const { buildUrl } = __testables;
 
@@ -47,6 +50,7 @@ describe("buildUrl", () => {
 describe("request 错误处理", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    setApiToken("");
   });
 
   it("HTTP 404 + JSON detail → ApiError 带 status 与 detail", async () => {
@@ -103,6 +107,20 @@ describe("request 错误处理", () => {
     expect(data).toEqual({ period: "month" });
   });
 
+  it("配置浏览器令牌后只通过 Authorization header 发送", async () => {
+    setApiToken("fixture-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer fixture-token");
+        return new Response(JSON.stringify({ period: "week" }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    await getStats("week");
+  });
+
   it("项目情报传递观察窗口与上次访问日期", async () => {
     vi.stubGlobal(
       "fetch",
@@ -116,5 +134,25 @@ describe("request 错误处理", () => {
     );
     const data = await getProjectIntelligence(90, "2026-08-01");
     expect(data.pulses).toEqual([]);
+  });
+
+  it("语义纠错使用带身份的 JSON POST", async () => {
+    setApiToken("fixture-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toContain("/simple/semantic-feedback");
+        expect(init?.method).toBe("POST");
+        expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer fixture-token");
+        expect(JSON.parse(String(init?.body)).rating).toBe("incorrect");
+        return new Response(JSON.stringify({ ok: true, item: {} }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    await recordSemanticFeedback({
+      view: "storyline", item_id: "storyline:demo", project_id: "demo",
+      rating: "incorrect", text: "摘要有误", source_dates: ["2026-08-01"],
+    });
   });
 });

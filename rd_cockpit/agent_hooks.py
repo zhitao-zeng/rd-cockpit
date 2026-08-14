@@ -276,7 +276,9 @@ def _recent_project(ledger: Ledger, session_id: str, incoming: dict[str, Any]) -
     clauses = [
         "session_id=?",
         "project_id IS NOT NULL",
-        "event_type IN ('agent_tool_completed','agent_tool_failed')",
+        "event_type IN ("
+        "'test_completed','test_failed','benchmark_completed',"
+        "'experiment_completed','experiment_failed','agent_tool_failed')",
         "event_id NOT IN (SELECT supersedes FROM events WHERE supersedes IS NOT NULL)",
     ]
     args: list[Any] = [session_id]
@@ -359,23 +361,53 @@ def _record_tool(home: Path, ledger: Ledger, source: str, incoming: dict[str, An
     kind = _classify_command(command)
     tool_id = str(incoming.get("tool_use_id") or hashlib.sha256(
         f"{session_id}:{command}:{_event_time(incoming)}".encode()).hexdigest()[:20])
-    repo_path, commit_sha, dirty = _snap(home, project_id)
-    compact_response = response[-2400:] if response else ""
-    observed_id = ledger.append(
-        event_type="agent_tool_failed" if failed else "agent_tool_completed", source=source,
-        project_id=project_id, session_id=session_id, machine=machine_name(home),
-        repo_path=repo_path, commit_sha=commit_sha, dirty=dirty,
-        status="failed" if failed else "passed", provenance="observed",
-        payload={"tool_name": incoming.get("tool_name"), "tool_use_id": tool_id,
-                 "turn_id": incoming.get("turn_id") or incoming.get("prompt_id"),
-                 "command": command[:4000], "duration_ms": incoming.get("duration_ms"),
-                 "response_excerpt": compact_response, "semantic_kind": kind},
-        evidence=_evidence(incoming),
-        dedup_key=f"agent-hook:{source}:{session_id}:tool:{tool_id}",
-        occurred_at=_event_time(incoming),
+    occurred_at = _event_time(incoming)
+    ledger.record_agent_activity(
+        source=source, session_id=session_id, project_id=project_id,
+        semantic_kind=kind or "other", failed=failed,
+        duration_ms=incoming.get("duration_ms"), occurred_at=occurred_at,
+        activity_key=f"{source}:{session_id}:{tool_id}",
     )
-    if not kind or not project_id or re.search(r"(?:^|\s)rd\s+run(?:\s|$)", command):
-        return {"observed_event": observed_id, "classified": kind, "project_id": project_id}
+    # Ordinary shell navigation, file reads and formatting are intentionally
+    # aggregated per Session/day rather than appended as individual events.
+    # Failures remain individual facts; tests, benchmarks and experiments are
+    # represented by their semantic event below.
+    if not kind:
+        failed_id = None
+        if failed:
+            repo_path, commit_sha, dirty = _snap(home, project_id)
+            failed_id = ledger.append(
+                event_type="agent_tool_failed", source=source, project_id=project_id,
+                session_id=session_id, machine=machine_name(home), repo_path=repo_path,
+                commit_sha=commit_sha, dirty=dirty, status="failed", provenance="observed",
+                payload={"tool_name": incoming.get("tool_name"), "tool_use_id": tool_id,
+                         "turn_id": incoming.get("turn_id") or incoming.get("prompt_id"),
+                         "command": command[:4000], "duration_ms": incoming.get("duration_ms"),
+                         "response_excerpt": response[-2400:]},
+                evidence=_evidence(incoming),
+                dedup_key=f"agent-hook:{source}:{session_id}:tool-failed:{tool_id}",
+                occurred_at=occurred_at,
+            )
+        return {"observed_event": failed_id, "classified": None, "project_id": project_id,
+                "ignored_reason": "non_semantic_tool" if not failed else None}
+    repo_path, commit_sha, dirty = _snap(home, project_id)
+    wrapped_rd_run = bool(re.search(r"(?:^|\s)rd\s+run(?:\s|$)", command))
+    if not project_id or wrapped_rd_run:
+        failed_id = None
+        if failed and not wrapped_rd_run:
+            failed_id = ledger.append(
+                event_type="agent_tool_failed", source=source, project_id=None,
+                session_id=session_id, machine=machine_name(home), status="failed",
+                provenance="observed",
+                payload={"tool_name": incoming.get("tool_name"), "tool_use_id": tool_id,
+                         "turn_id": incoming.get("turn_id") or incoming.get("prompt_id"),
+                         "command": command[:4000], "duration_ms": incoming.get("duration_ms"),
+                         "response_excerpt": response[-2400:], "semantic_kind": kind},
+                evidence=_evidence(incoming),
+                dedup_key=f"agent-hook:{source}:{session_id}:tool-failed:{tool_id}",
+                occurred_at=occurred_at,
+            )
+        return {"observed_event": failed_id, "classified": kind, "project_id": project_id}
 
     parameters = _parameters(command)
     semantic_response = _test_result_window(response) if kind == "test" else response
@@ -393,7 +425,7 @@ def _record_tool(home: Path, ledger: Ledger, source: str, incoming: dict[str, An
         "model": parameters.get("model") or parameters.get("model_path") or parameters.get("checkpoint"),
         "metrics": {item["name"]: item["value"] for item in metrics}, "metric_items": metrics,
         "test_counts": counts, "result": semantic_response[-1200:],
-        "fingerprint": fingerprint, "supports": [observed_id],
+        "fingerprint": fingerprint, "supports": [],
         "extraction": {"method": "agent_tool_rule", "confidence": "inferred",
                        "host_event": incoming.get("hook_event_name")},
     }
@@ -401,9 +433,9 @@ def _record_tool(home: Path, ledger: Ledger, source: str, incoming: dict[str, An
         event_type=semantic_type, source=source, project_id=project_id, session_id=session_id,
         machine=machine_name(home), repo_path=repo_path, commit_sha=commit_sha, dirty=dirty,
         status="failed" if failed else "passed", provenance="inferred", payload=payload,
-        evidence=[*_evidence(incoming), {"type": "event_ref", "path": f"event:{observed_id}"}],
+        evidence=_evidence(incoming),
         dedup_key=f"agent-hook:{source}:{session_id}:semantic:{tool_id}:{kind}",
-        occurred_at=_event_time(incoming),
+        occurred_at=occurred_at,
     )
     metric_ids = []
     for item in metrics:
@@ -412,11 +444,11 @@ def _record_tool(home: Path, ledger: Ledger, source: str, incoming: dict[str, An
             machine=machine_name(home), repo_path=repo_path, commit_sha=commit_sha, dirty=dirty,
             status="observed", provenance="observed",
             payload={**item, "experiment_id": experiment_id, "source_event": semantic_id},
-            evidence=[{"type": "event_ref", "path": f"event:{observed_id}"}],
+            evidence=[{"type": "event_ref", "path": f"event:{semantic_id}"}],
             dedup_key=f"agent-hook:{source}:{session_id}:metric:{tool_id}:{item['name']}:{item['value']}",
-            occurred_at=_event_time(incoming),
+            occurred_at=occurred_at,
         ))
-    return {"observed_event": observed_id, "semantic_event": semantic_id,
+    return {"observed_event": None, "semantic_event": semantic_id,
             "metric_events": metric_ids, "classified": kind, "project_id": project_id}
 
 

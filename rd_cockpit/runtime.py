@@ -8,11 +8,34 @@ from pathlib import Path
 
 
 def executable(env_name: str, command: str) -> str:
-    """Resolve an optional tool without embedding an author's home path."""
-    configured = os.environ.get(env_name)
+    """Resolve an optional tool without embedding an author's home path.
+
+    A task-specific override wins, followed by the shared ``RD_CODEX_BIN`` or
+    ``RD_CLAUDE_BIN`` setting.  The shared setting matters for systemd/cron:
+    those processes intentionally have a small PATH and otherwise fail even
+    though the executable is available in an interactive shell.
+    """
+    shared_name = {
+        "codex": "RD_CODEX_BIN",
+        "claude": "RD_CLAUDE_BIN",
+    }.get(command)
+    configured = os.environ.get(env_name) or (os.environ.get(shared_name) if shared_name else None)
     if configured:
         return str(Path(configured).expanduser())
     return shutil.which(command) or command
+
+
+def executable_status(env_name: str, command: str) -> dict[str, str | bool]:
+    """Return a serializable preflight result for background task status."""
+    resolved = executable(env_name, command)
+    candidate = Path(resolved).expanduser()
+    available = candidate.is_file() and os.access(candidate, os.X_OK)
+    if not available and os.path.sep not in resolved:
+        located = shutil.which(resolved)
+        if located:
+            resolved = located
+            available = True
+    return {"command": command, "path": resolved, "available": available}
 
 
 def daily_report_directory() -> Path:

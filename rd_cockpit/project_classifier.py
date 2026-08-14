@@ -2,7 +2,7 @@
 
 Opening the UI never invokes a model.  This module batches only records left
 in the ``asr_other`` fallback after deterministic path matching, asks the
-local DeepSeek route once, validates the result, and stores reusable decisions
+configured audit model once, validates the result against registered projects, and stores reusable decisions
 beside the daily reports.
 """
 
@@ -13,18 +13,17 @@ import hashlib
 import json
 import os
 import re
-import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-from .runtime import daily_report_directory, executable as resolve_executable
+from .artifact_cache import atomic_write_json
+from .model_runner import run_claude_json, run_codex_json
+from .runtime import daily_report_directory
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+PROMPT_VERSION = 2
 CONFIDENCE_THRESHOLD = 0.75
 DEFAULT_ENDPOINT = "http://127.0.0.1:4000/v1/messages"
 
@@ -34,12 +33,24 @@ def _strings(value: Any) -> list[str]:
 
 def task_fingerprint(report_date: str | None, task: dict[str, Any]) -> str:
     stable = {
+        "prompt_version": PROMPT_VERSION,
         "date": report_date or "",
         "title": str(task.get("title") or ""),
         "did": _strings(task.get("did")),
         "why": _strings(task.get("why")),
         "results": _strings(task.get("results")),
         "files": _strings(task.get("files")),
+        "conclusions": _strings(task.get("conclusions")),
+    }
+    encoded = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
+
+
+def _legacy_task_fingerprint(report_date: str | None, task: dict[str, Any]) -> str:
+    stable = {
+        "date": report_date or "", "title": str(task.get("title") or ""),
+        "did": _strings(task.get("did")), "why": _strings(task.get("why")),
+        "results": _strings(task.get("results")), "files": _strings(task.get("files")),
         "conclusions": _strings(task.get("conclusions")),
     }
     encoded = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -55,10 +66,18 @@ def _load_cache(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         value = {}
-    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(value, dict):
         return {"schema_version": SCHEMA_VERSION, "entries": {}, "runs": []}
+    if value.get("schema_version") != SCHEMA_VERSION:
+        legacy_entries = value.get("entries") if value.get("schema_version") == 1 else {}
+        return {
+            "schema_version": SCHEMA_VERSION, "entries": {},
+            "legacy_entries": legacy_entries if isinstance(legacy_entries, dict) else {},
+            "runs": value.get("runs") if isinstance(value.get("runs"), list) else [],
+        }
     value.setdefault("entries", {})
     value.setdefault("runs", [])
+    value.setdefault("legacy_entries", {})
     return value
 
 
@@ -67,7 +86,23 @@ def cached_classification(
 ) -> dict[str, Any] | None:
     value = _load_cache(_cache_path(report_path))
     item = value["entries"].get(task_fingerprint(report_date, task))
-    return item if isinstance(item, dict) else None
+    if not isinstance(item, dict):
+        return None
+    from .project_identity import registered_project_names
+    from .semantic_policy import catalog_fingerprint, policy_fingerprint
+
+    allowed = registered_project_names()
+    expected = policy_fingerprint(
+        "daily-report-project-classification",
+        schema_version=SCHEMA_VERSION,
+        prompt_version=PROMPT_VERSION,
+        models=(
+            os.environ.get("RD_PROJECT_CLASSIFY_MODEL", "codex:gpt-5.6-sol@medium"),
+            os.environ.get("RD_PROJECT_CLASSIFY_FALLBACK_MODEL", "deepseek-local"),
+        ),
+        extra={"catalog": catalog_fingerprint(allowed)},
+    )
+    return item if item.get("policy_fingerprint") == expected else None
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -106,80 +141,48 @@ def _instruction(records: list[dict[str, Any]], allowed: dict[str, str]) -> dict
 
 def _request(model: str, records: list[dict[str, Any]], allowed: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     instruction = _instruction(records, allowed)
-    payload = {
-        "model": model, "max_tokens": max(2000, len(records) * 180),
-        "temperature": 0, "stream": False,
-        "system": "你是研发日报项目分类审计器。只分类，不总结，不补充事实。",
-        "messages": [{"role": "user", "content": json.dumps(instruction, ensure_ascii=False)}],
-    }
-    endpoint = os.environ.get("RD_PROJECT_CLASSIFY_LLM_URL", DEFAULT_ENDPOINT)
-    request = Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                      headers={"Content-Type": "application/json", "x-api-key": "local-router",
-                               "anthropic-version": "2023-06-01"}, method="POST")
-    try:
-        with urlopen(request, timeout=float(os.environ.get("RD_PROJECT_CLASSIFY_TIMEOUT", "180"))) as response:  # noqa: S310
-            outer = json.load(response)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-    text = "".join(str(block.get("text") or "") for block in outer.get("content") or []
-                   if isinstance(block, dict) and block.get("type") == "text")
-    parsed = _json_object(text)
+    parsed, metadata = run_claude_json(
+        model, instruction, prompt="你是研发日报项目分类审计器。只分类，不总结，不补充事实。只返回 JSON。",
+        executable_env="RD_PROJECT_CLASSIFY_CLAUDE_BIN",
+        timeout_env="RD_PROJECT_CLASSIFY_TIMEOUT", default_timeout=180,
+        run_context={
+            "home": os.environ.get("RD_COCKPIT_HOME"), "stage": "classification",
+            "source_hash": hashlib.sha256(
+                json.dumps(instruction, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(), "fallback_used": True,
+            "reason": "出现无法通过路径规则归类的日报段落。",
+        },
+    )
     items = parsed.get("classifications")
     if not isinstance(items, list):
         raise ValueError("model output is missing classifications")
-    return items, outer.get("usage") or {}
+    return items, {**(metadata.get("usage") or {}), "provider": metadata.get("provider")}
 
 
 def _request_codex(
     model_spec: str, records: list[dict[str, Any]], allowed: dict[str, str],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    model_and_effort = model_spec.removeprefix("codex:")
-    model, separator, reasoning = model_and_effort.partition("@")
-    if not separator:
-        reasoning = os.environ.get("RD_PROJECT_CLASSIFY_CODEX_REASONING", "medium")
-    executable = resolve_executable("RD_PROJECT_CLASSIFY_CODEX_BIN", "codex")
     prompt = "对标准输入中的 JSON 执行项目分类。严格按输入的 output_schema 返回纯 JSON。"
     instruction = _instruction(records, allowed)
-    timeout = float(os.environ.get("RD_PROJECT_CLASSIFY_CODEX_TIMEOUT", "240"))
-    with tempfile.TemporaryDirectory(prefix="rd-project-classifier-") as temporary:
-        message_path = Path(temporary) / "last-message.json"
-        command = [
-            executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--skip-git-repo-check", "--sandbox", "read-only", "--model", model,
-            "-c", 'model_provider="openai"',
-            "-c", f'model_reasoning_effort="{reasoning}"',
-            "-C", str(Path(__file__).resolve().parents[1]), "--json",
-            "--output-last-message", str(message_path), prompt,
-        ]
-        try:
-            completed = subprocess.run(
-                command, input=json.dumps(instruction, ensure_ascii=False), capture_output=True,
-                text=True, timeout=timeout, check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"Codex timed out after {timeout:g}s") from exc
-        except OSError as exc:
-            raise RuntimeError(f"could not start Codex: {exc}") from exc
-        if completed.returncode:
-            detail = completed.stderr.strip().splitlines()
-            suffix = f": {detail[-1][:300]}" if detail else ""
-            raise RuntimeError(f"Codex exited with {completed.returncode}{suffix}")
-        try:
-            parsed = _json_object(message_path.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            raise RuntimeError(f"invalid Codex structured output: {exc}") from exc
-        usage: dict[str, Any] = {}
-        for line in completed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-                usage = event["usage"]
+    parsed, metadata = run_codex_json(
+        model_spec, instruction, prompt=prompt, executable_env="RD_PROJECT_CLASSIFY_CODEX_BIN",
+        timeout_env="RD_PROJECT_CLASSIFY_CODEX_TIMEOUT", default_timeout=240,
+        reasoning_env="RD_PROJECT_CLASSIFY_CODEX_REASONING",
+        workdir=Path(__file__).resolve().parents[1], temp_prefix="rd-project-classifier-",
+        run_context={
+            "home": os.environ.get("RD_COCKPIT_HOME"), "stage": "classification",
+            "source_hash": hashlib.sha256(
+                json.dumps(instruction, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "reason": "出现无法通过路径规则归类的日报段落。",
+        },
+    )
     items = parsed.get("classifications")
     if not isinstance(items, list):
         raise ValueError("Codex output is missing classifications")
-    return items, {**usage, "reasoning_effort": reasoning, "provider": "codex-cli"}
+    return items, {**metadata.get("usage", {}),
+                   "reasoning_effort": metadata["reasoning_effort"],
+                   "provider": metadata["provider"]}
 
 
 def _request_model(
@@ -191,11 +194,26 @@ def _request_model(
 
 
 def classify_directory(report_dir: Path, *, force: bool = False) -> dict[str, Any]:
-    from .daily_source import parse_report, project_display_names
+    from .daily_source import parse_report
+    from .project_identity import registered_project_names
+    from .semantic_policy import catalog_fingerprint, policy_fingerprint
 
     cache_path = report_dir / "data" / "project-classifications.json"
     cache = _load_cache(cache_path)
+    allowed = registered_project_names()
+    primary = os.environ.get(
+        "RD_PROJECT_CLASSIFY_MODEL", "codex:gpt-5.6-sol@medium",
+    ).strip()
+    fallback = os.environ.get("RD_PROJECT_CLASSIFY_FALLBACK_MODEL", "deepseek-local").strip()
+    policy = policy_fingerprint(
+        "daily-report-project-classification",
+        schema_version=SCHEMA_VERSION,
+        prompt_version=PROMPT_VERSION,
+        models=(primary, fallback),
+        extra={"catalog": catalog_fingerprint(allowed)},
+    )
     pending: list[dict[str, Any]] = []
+    migrated = 0
     for report_path in sorted(report_dir.glob("????-??-??.md")):
         report = parse_report(report_path, apply_project_cache=not force)
         for group in report.get("groups") or []:
@@ -203,7 +221,20 @@ def classify_directory(report_dir: Path, *, force: bool = False) -> dict[str, An
                 if task.get("project_ids") != ["asr_other"]:
                     continue
                 key = task_fingerprint(report.get("date"), task)
-                if not force and key in cache["entries"]:
+                if (
+                    not force and key in cache["entries"]
+                    and (cache["entries"].get(key) or {}).get("policy_fingerprint") == policy
+                ):
+                    continue
+                legacy = None if force else (cache.get("legacy_entries") or {}).get(
+                    _legacy_task_fingerprint(report.get("date"), task),
+                )
+                if isinstance(legacy, dict) and str(legacy.get("project_id") or "") in allowed:
+                    cache["entries"][key] = {
+                        **legacy, "policy_fingerprint": policy, "prompt_version": PROMPT_VERSION,
+                        "cache_migration": {"from_schema": 1, "model_call": False},
+                    }
+                    migrated += 1
                     continue
                 pending.append({
                     "key": key, "date": report.get("date"), "title": task.get("title"),
@@ -212,13 +243,12 @@ def classify_directory(report_dir: Path, *, force: bool = False) -> dict[str, An
                     "conclusions": _strings(task.get("conclusions")),
                 })
     if not pending:
-        return {"status": "cached", "pending": 0, "classified": 0, "path": str(cache_path)}
+        if migrated:
+            cache["legacy_entries"] = {}
+            atomic_write_json(cache_path, cache)
+        return {"status": "migrated" if migrated else "cached", "pending": 0,
+                "classified": 0, "migrated": migrated, "path": str(cache_path)}
 
-    allowed = project_display_names()
-    primary = os.environ.get(
-        "RD_PROJECT_CLASSIFY_MODEL", "codex:gpt-5.6-sol@medium",
-    ).strip()
-    fallback = os.environ.get("RD_PROJECT_CLASSIFY_FALLBACK_MODEL", "deepseek-local").strip()
     models = list(dict.fromkeys(model for model in (primary, fallback) if model))
     attempts: list[dict[str, Any]] = []
     selected: str | None = None
@@ -250,6 +280,7 @@ def classify_directory(report_dir: Path, *, force: bool = False) -> dict[str, An
         cache["entries"][item["key"]] = {
             "project_id": project_id, "confidence": confidence,
             "reason": str(item.get("reason") or "").strip(), "model": selected,
+            "policy_fingerprint": policy, "prompt_version": PROMPT_VERSION,
             "classified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         stored += 1
@@ -259,12 +290,11 @@ def classify_directory(report_dir: Path, *, force: bool = False) -> dict[str, An
         "fallback_used": selected != primary, "records": len(pending), "stored": stored,
         "attempts": attempts,
     })
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = cache_path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, cache_path)
+    cache["legacy_entries"] = {}
+    atomic_write_json(cache_path, cache)
     return {"status": "generated", "pending": len(pending), "classified": stored,
-            "model": selected, "path": str(cache_path), "attempts": attempts}
+            "migrated": migrated, "model": selected, "path": str(cache_path),
+            "attempts": attempts}
 
 
 def main() -> None:

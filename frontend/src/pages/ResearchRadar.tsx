@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { getResearchRadar } from "../lib/api";
 import { fmtDate, fmtDateTime } from "../lib/format";
 import type { ResearchRadarItem } from "../lib/types";
@@ -134,28 +134,12 @@ function PaperCard({ paper }: { paper: ResearchRadarItem }) {
 export function ResearchRadar() {
   const [project, setProject] = useState("");
   const [qualityView, setQualityView] = useState<"recommended" | "all">("recommended");
-  const [refreshing, setRefreshing] = useState(false);
-  const [refreshError, setRefreshError] = useState<string | null>(null);
-  const queryClient = useQueryClient();
-  const key = ["research-radar"];
+  const key = ["research-radar", project];
   const radar = useQuery({
     queryKey: key,
-    queryFn: () => getResearchRadar(),
+    queryFn: () => getResearchRadar(project || undefined),
     staleTime: 10 * 60_000,
   });
-
-  async function refresh() {
-    setRefreshing(true);
-    setRefreshError(null);
-    try {
-      const value = await getResearchRadar(undefined, true);
-      queryClient.setQueryData(key, value);
-    } catch (error) {
-      setRefreshError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setRefreshing(false);
-    }
-  }
 
   return (
     <div className="space-y-4">
@@ -182,13 +166,7 @@ export function ResearchRadar() {
                 <option key={id} value={id}>{value.name}</option>
               ))}
             </select>
-            <button
-              onClick={refresh}
-              disabled={refreshing}
-              className="rounded-md border border-line px-3 py-1.5 text-xs text-ink2 hover:border-primary hover:text-primary disabled:opacity-50"
-            >
-              {refreshing ? "正在更新…" : "更新论文"}
-            </button>
+            <span className="rounded-md border border-line px-3 py-1.5 text-xs text-ink3">每日后台更新</span>
           </div>
         )}
       />
@@ -197,8 +175,6 @@ export function ResearchRadar() {
         <span className="font-medium text-ink">现在不是按“最新”硬塞论文：</span>
         相关度 40 分、研究质量 35 分、实际价值 25 分。默认只展示 A/B 级；C 级保留在候选视图，D 级直接排除。更新时保留高质量锚点，其余位置优先换成从未展示过的合格论文。
       </div>
-
-      {refreshError && <div className="rounded-md border border-critical/30 bg-critical/5 px-3 py-2 text-xs text-critical">更新失败：{refreshError}</div>}
 
       <QueryBoundary
         query={radar}

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { DailyReportView } from "../components/DailyReportView";
+import { BackgroundTaskStatusPanel } from "../components/BackgroundTaskStatus";
 import { LifeBar } from "../components/LifeBar";
 import { ProjectDiscoveryPanel } from "../components/ProjectDiscoveryPanel";
 import { PageHeader, QueryBoundary } from "../components/ui";
@@ -23,6 +24,7 @@ export function SimpleOverview() {
         right={<Link to="/records" className="rounded-md border border-line px-3 py-1.5 text-xs text-ink2 hover:border-primary hover:text-primary">选择日期或项目</Link>}
       />
       <ProjectDiscoveryPanel />
+      <BackgroundTaskStatusPanel />
       <QueryBoundary query={report}>
         {(data) => <DailyReportView report={data} compact />}
       </QueryBoundary>

@@ -4,7 +4,11 @@ import json
 from datetime import date
 from pathlib import Path
 
-from rd_cockpit.intelligence import project_intelligence
+from rd_cockpit.intelligence import _intelligence_for, project_intelligence
+from rd_cockpit.intelligence_backfill import (
+    DEFAULT_FALLBACK, DEFAULT_MODEL, PROMPT_VERSION, SCHEMA_VERSION,
+)
+from rd_cockpit.semantic_policy import catalog_fingerprint, policy_fingerprint
 
 
 def _report(day: str, result: str, blocker: str = "", next_action: str = "") -> str:
@@ -136,6 +140,36 @@ def test_same_latest_baseline_produces_empty_delta(tmp_path: Path, monkeypatch) 
     result = project_intelligence(tmp_path, days=30, baseline=date(2026, 8, 1), target=date(2026, 8, 2))
     assert result["baseline_date"] == "2026-08-01"
     assert result["project_details"]["asr"]["delta"]["change_count"] == 0
+
+
+def test_failed_reaudit_uses_explicitly_labelled_last_good_snapshot(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "projects.yaml"
+    config.write_text("projects:\n  asr:\n    name: ASR\n", encoding="utf-8")
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
+    report_path = tmp_path / "2026-08-01.md"
+    report_path.write_text("# 日报 2026-08-01\n\n旧内容已变化\n", encoding="utf-8")
+    data = tmp_path / "data"
+    data.mkdir()
+    policy = policy_fingerprint(
+        "project-intelligence-backfill", schema_version=SCHEMA_VERSION,
+        prompt_version=PROMPT_VERSION, models=(DEFAULT_MODEL, DEFAULT_FALLBACK),
+        extra={"catalog": catalog_fingerprint({"asr": "ASR"})},
+    )
+    (data / "2026-08-01_intelligence_validated.json").write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION, "prompt_version": PROMPT_VERSION,
+        "policy_fingerprint": policy, "source_sha256": "old-source",
+        "project_updates": [{"project_id": "asr", "summary": "上次可信摘要"}],
+    }), encoding="utf-8")
+    (data / "intelligence_backfill_status.json").write_text(json.dumps({
+        "failed": [{"date": "2026-08-01", "error": "quality gate rejected"}],
+    }), encoding="utf-8")
+
+    value, mode = _intelligence_for({
+        "date": "2026-08-01", "source_path": str(report_path),
+    })
+
+    assert mode == "stale_last_good"
+    assert value and value["project_updates"][0]["summary"] == "上次可信摘要"
 
 
 def test_stale_unknown_leaves_current_board_without_being_deleted(tmp_path: Path, monkeypatch) -> None:

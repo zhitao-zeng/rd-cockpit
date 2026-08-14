@@ -1,5 +1,22 @@
 import { useEffect, useRef } from "react";
-import * as echarts from "echarts";
+import { BarChart, LineChart } from "echarts/charts";
+import {
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+} from "echarts/components";
+import * as echarts from "echarts/core";
+import { CanvasRenderer } from "echarts/renderers";
+import type { ECElementEvent, EChartsCoreOption, EChartsType } from "echarts/core";
+
+echarts.use([
+  BarChart,
+  LineChart,
+  GridComponent,
+  LegendComponent,
+  TooltipComponent,
+  CanvasRenderer,
+]);
 
 // 统一图表封装：初始化、resize、option 更新。
 // 主题常量见 chartTheme.ts，所有图表必须带 tooltip。
@@ -9,12 +26,12 @@ export function Chart({
   height = 260,
   onClick,
 }: {
-  option: echarts.EChartsOption;
+  option: EChartsCoreOption;
   height?: number;
-  onClick?: (params: echarts.ECElementEvent) => void;
+  onClick?: (params: ECElementEvent) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<echarts.ECharts | null>(null);
+  const chartRef = useRef<EChartsType | null>(null);
 
   useEffect(() => {
     if (!ref.current) return;

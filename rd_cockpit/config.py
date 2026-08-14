@@ -168,9 +168,11 @@ def add_project(
     updated = prefix + block + "\n" + suffix
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(updated, encoding="utf-8")
+    os.chmod(temporary, 0o600)
     # Parse the exact candidate before replacing the authoritative config.
     yaml.safe_load(temporary.read_text(encoding="utf-8"))
     os.replace(temporary, path)
+    os.chmod(path, 0o600)
     return {"project_id": project_id, **entry, "config_path": str(path)}
 
 

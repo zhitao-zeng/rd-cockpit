@@ -191,10 +191,31 @@ def cmd_algorithm_analyze(args: argparse.Namespace) -> int:
         model=args.model,
         fallback_model=args.fallback_model,
         force=args.force,
+        max_model_calls=args.max_model_calls,
         progress=lambda message: print(message, file=sys.stderr, flush=True),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result["failures"] or result["counts"]["analysis_failed"] else 0
+
+
+def cmd_radar_refresh(args: argparse.Namespace) -> int:
+    """Refresh paper metadata and Chinese summaries outside browser requests."""
+    from .research_radar import research_radar
+    from .task_status import update_status
+
+    home = _home(args.home)
+    update_status(home, "radar", "running")
+    try:
+        result = research_radar(home, project=args.project, refresh=True)
+    except Exception as exc:
+        update_status(home, "radar", "failed", f"{type(exc).__name__}: {exc}"[:500])
+        raise
+    update_status(
+        home, "radar", "ok",
+        f"{result.get('item_count', 0)} papers · {result.get('generated_at') or 'unknown'}",
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -766,6 +787,80 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve_web(args: argparse.Namespace) -> int:
+    home = _home(args.home)
+    try:
+        import uvicorn
+        from .web import create_web_app
+    except ImportError as exc:
+        raise SystemExit("web service requires uvicorn and fastapi; install with: pip install -e '.[server]'") from exc
+    dist = Path(args.dist).expanduser().resolve() if args.dist else home / "frontend" / "dist"
+    uvicorn.run(create_web_app(home, dist), host=args.host, port=args.port, log_level=args.log_level)
+    return 0
+
+
+def cmd_maintain(args: argparse.Namespace) -> int:
+    from .maintenance import maintain
+    from .task_status import update_status
+
+    home = _home(args.home)
+    update_status(home, "maintenance", "running")
+    try:
+        result = maintain(
+            home, backup_retention_days=max(1, args.backup_retention_days),
+            resource_retention_days=max(1, args.resource_retention_days),
+            cold_retention_days=max(1, args.cold_retention_days),
+            prune_resources=not args.no_prune_resources,
+        )
+    except Exception as exc:
+        update_status(home, "maintenance", "failed", f"{type(exc).__name__}: {exc}"[:500])
+        raise
+    update_status(
+        home, "maintenance", "ok",
+        (f"backup ok · legacy archived {result['legacy_archive']['events']} · "
+         f"cold moved {result['cold_store']['removed_from_hot']} · "
+         f"resource rows removed {result['resources']['source_rows_deleted']}"),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_materialize_views(args: argparse.Namespace) -> int:
+    from .view_cache import materialize_all
+
+    home = _home(args.home)
+    target = date.fromisoformat(args.date) if args.date else date.today()
+    result = materialize_all(home, force=args.force, target=target)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_semantic_eval(args: argparse.Namespace) -> int:
+    from .semantic_eval import DEFAULT_CASES, evaluate_cases
+
+    result = evaluate_cases(Path(args.cases).expanduser().resolve() if args.cases else DEFAULT_CASES)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["failed"] else 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from .doctor import doctor
+
+    result = doctor(
+        _home(args.home), check_services=not args.no_services,
+        restore_drill=not args.no_restore,
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        symbols = {"ok": "✓", "warning": "△", "error": "✗"}
+        for item in result["checks"]:
+            print(f"{symbols[item['status']]} {item['summary']}")
+        summary = result["summary"]
+        print(f"\n{summary['checks']} 项检查 · {summary['errors']} 个错误 · {summary['warnings']} 个提醒")
+    return 1 if result["summary"]["errors"] else 0
+
+
 def cmd_mcp_stdio(args: argparse.Namespace) -> int:
     from .mcp_stdio import run_stdio
     return run_stdio(_home(args.home))
@@ -907,7 +1002,7 @@ def cmd_usage_sync(args: argparse.Namespace) -> int:
             # caused every interactive Agent hook to hit its five-second limit.
             home, ledger = _ledger(args)
             try:
-                result = sync_usage(ledger, home, days=args.days)
+                result = sync_usage(ledger, home, days=args.days, force=args.force and count == 0)
                 result["hook_queue"] = drain_hook_queue(home, ledger)
             finally:
                 ledger.close()
@@ -1027,7 +1122,16 @@ def parser() -> argparse.ArgumentParser:
     algorithm_analyze.add_argument("--model", default="codex:gpt-5.6-sol@medium")
     algorithm_analyze.add_argument("--fallback-model", default="deepseek-local")
     algorithm_analyze.add_argument("--force", action="store_true", help="ignore an unchanged-source cache hit")
+    algorithm_analyze.add_argument(
+        "--max-model-calls", type=int,
+        help="maximum model attempts for this run (default: RD_ALGORITHM_MAX_MODEL_CALLS or 4)",
+    )
     algorithm_analyze.set_defaults(func=cmd_algorithm_analyze)
+    radar_refresh = sub.add_parser(
+        "radar-refresh", help="refresh the cached paper radar outside browser requests",
+    )
+    radar_refresh.add_argument("--project")
+    radar_refresh.set_defaults(func=cmd_radar_refresh)
     status = sub.add_parser("status"); status.add_argument("project", nargs="?"); status.add_argument("--json", action="store_true"); status.set_defaults(func=cmd_status)
     scan = sub.add_parser("scan", help="record read-only Git snapshots; optionally keep watching")
     scan.add_argument("project", nargs="?"); scan.add_argument("--watch", action="store_true")
@@ -1065,6 +1169,32 @@ def parser() -> argparse.ArgumentParser:
     install_hooks.add_argument("--user-home", help=argparse.SUPPRESS)
     install_hooks.set_defaults(func=cmd_install_hooks)
     serve = sub.add_parser("serve", help="run the localhost-only read-only API"); serve.add_argument("--host", default="127.0.0.1"); serve.add_argument("--port", type=int, default=8787); serve.add_argument("--log-level", default="warning"); serve.set_defaults(func=cmd_serve)
+    serve_web = sub.add_parser("serve-web", help="serve the prebuilt web UI and read-only API")
+    serve_web.add_argument("--host", default="127.0.0.1")
+    serve_web.add_argument("--port", type=int, default=4016)
+    serve_web.add_argument("--dist")
+    serve_web.add_argument("--log-level", default="warning")
+    serve_web.set_defaults(func=cmd_serve_web)
+    maintenance = sub.add_parser("maintain", help="backup, archive and compact local derived data")
+    maintenance.add_argument("--backup-retention-days", type=int, default=14)
+    maintenance.add_argument("--resource-retention-days", type=int, default=30)
+    maintenance.add_argument("--cold-retention-days", type=int, default=30)
+    maintenance.add_argument("--no-prune-resources", action="store_true")
+    maintenance.set_defaults(func=cmd_maintain)
+    materialize = sub.add_parser("materialize-views", help="precompute expensive read-only dashboard views")
+    materialize.add_argument("--date")
+    materialize.add_argument("--force", action="store_true")
+    materialize.set_defaults(func=cmd_materialize_views)
+    semantic_eval = sub.add_parser(
+        "semantic-eval", help="run offline golden checks for Daily Report semantic extraction",
+    )
+    semantic_eval.add_argument("--cases")
+    semantic_eval.set_defaults(func=cmd_semantic_eval)
+    doctor = sub.add_parser("doctor", help="run read-only database, cache, backup and service checks")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--no-services", action="store_true")
+    doctor.add_argument("--no-restore", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
     mcp = sub.add_parser("mcp-stdio", help="run read-only MCP JSON-RPC tools over stdin/stdout"); mcp.set_defaults(func=cmd_mcp_stdio)
     dashboard = sub.add_parser("dashboard", help="generate a local read-only HTML dashboard"); dashboard.set_defaults(func=cmd_dashboard)
     insights = sub.add_parser("insights", help="deterministic fancy projections over the evidence ledger")
@@ -1083,7 +1213,8 @@ def parser() -> argparse.ArgumentParser:
     hypothesis.add_argument("--action", choices=["propose", "update"], default="propose"); hypothesis.add_argument("--project", required=True); hypothesis.add_argument("--hypothesis-id", required=True); hypothesis.add_argument("--statement", required=True); hypothesis.add_argument("--scope"); hypothesis.add_argument("--classification", choices=["supports_hypothesis", "rejects_hypothesis", "partially_supports", "unresolved"]); hypothesis.set_defaults(func=cmd_hypothesis)
     baseline_cmd = sub.add_parser("baseline", help="record or inspect a project baseline")
     baseline_cmd.add_argument("--project", required=True); baseline_cmd.add_argument("--record", action="store_true"); baseline_cmd.add_argument("--metric", action="append"); baseline_cmd.set_defaults(func=cmd_baseline)
-    usage_sync = sub.add_parser("usage-sync", help="import aggregate Codex/Claude Code token counters without message text")
+    usage_sync = sub.add_parser("usage-sync", help="incrementally import aggregate Codex/Claude Code token counters without message text")
+    usage_sync.add_argument("--force", action="store_true", help="re-read all recent transcripts once")
     usage_sync.add_argument("--days", type=int, default=30)
     usage_sync.add_argument("--watch", action="store_true")
     usage_sync.add_argument("--interval", type=int, default=300)
@@ -1107,6 +1238,10 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    # Domain model adapters intentionally receive only a small accounting
+    # context. Propagate the resolved CLI home once so manual `--home` runs are
+    # accounted in the same ledger as scheduled service runs.
+    os.environ["RD_COCKPIT_HOME"] = str(_home(args.home))
     return int(args.func(args))
 
 

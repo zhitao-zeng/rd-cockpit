@@ -2,7 +2,8 @@
 // 规则（dataviz）：文字用 ink tokens，categorical 固定顺序不循环，
 // status 色仅用于状态语义，网格/坐标轴弱化，标记细。
 
-import type { EChartsOption, SeriesOption } from "echarts";
+import type { SeriesOption } from "echarts";
+import type { EChartsCoreOption } from "echarts/core";
 
 export const C = {
   primary: "#22d3ee",
@@ -87,7 +88,7 @@ export function barSeries(
   } as SeriesOption;
 }
 
-export function baseChartOption(): EChartsOption {
+export function baseChartOption(): EChartsCoreOption {
   return {
     tooltip: { ...tooltipBase },
     grid: { ...gridBase },

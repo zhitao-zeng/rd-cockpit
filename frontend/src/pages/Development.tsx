@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Chart } from "../components/Chart";
+import { Chart } from "../components/ScatterChart";
 import { Card, EmptyState, PageHeader, QueryBoundary, StatCard } from "../components/ui";
-import { getDevelopment, getLifeDashboard } from "../lib/api";
+import {
+  getDevelopmentGlobal, getDevelopmentHistory, getDevelopmentProject,
+  getDevelopmentSummary, getLifeDashboard,
+} from "../lib/api";
 import { fmtTokens } from "../lib/format";
-import type { DevelopmentMetric, DevelopmentResponse, DevelopmentTaskNode, LifeDashboard } from "../lib/types";
+import type {
+  DevelopmentGlobalResponse, DevelopmentHistoryResponse, DevelopmentMetric,
+  DevelopmentProjectResponse, DevelopmentResponse, DevelopmentSummaryResponse,
+  DevelopmentTaskNode, LifeDashboard,
+} from "../lib/types";
 import { axisBase, baseChartOption, catColor, C, legendBase, tooltipBase } from "../lib/chartTheme";
 
 const PHASES = ["探索", "实现", "执行", "验证", "交付", "运维"];
@@ -60,25 +67,30 @@ function ProjectMetro({ data, project }: { data: DevelopmentResponse; project: s
 }
 
 function ResearchStarfield({ data }: { data: DevelopmentResponse }) {
-  const projects = [...data.lifecycles].filter((item) => item.project_id !== "unassigned" && data.storylines[item.project_id]?.length)
+  const projects = [...data.lifecycles].filter((item) => item.project_id !== "unassigned" && item.task_count > 0)
     .sort((a, b) => b.task_count - a.task_count).slice(0, 10);
-  const dates = [...new Set(projects.flatMap((project) => (data.storylines[project.project_id] ?? []).map((node) => node.date)))].sort().slice(-60);
-  const dateSet = new Set(dates);
+  const dates = data.activity.dates.slice(-60);
+  const start = Math.max(0, data.activity.dates.length - dates.length);
   const points = projects.flatMap((project, projectIndex) => {
-    const byDate = new Map<string, DevelopmentTaskNode[]>();
-    (data.storylines[project.project_id] ?? []).filter((node) => dateSet.has(node.date)).forEach((node) => byDate.set(node.date, [...(byDate.get(node.date) ?? []), node]));
-    return [...byDate.entries()].map(([date, nodes]) => ({
-      value: [date.slice(5), project.name, nodes.length],
-      nodes,
-      symbolSize: 7 + Math.min(17, nodes.length * 3),
+    const activity = data.activity.projects.find((item) => item.project_id === project.project_id);
+    return dates.flatMap((date, index) => {
+      const count = activity?.activities[start + index] ?? 0;
+      if (!count) return [];
+      return [{
+      value: [date.slice(5), project.name, count],
+      date,
+      projectName: project.name,
+      count,
+      symbolSize: 7 + Math.min(17, count * 3),
       itemStyle: {
         color: catColor(projectIndex),
-        borderColor: nodes.some((node) => node.status === "blocked") ? C.critical : C.ink,
-        borderWidth: nodes.some((node) => node.status === "blocked") ? 2 : 0.5,
+        borderColor: project.status === "blocked" ? C.critical : C.ink,
+        borderWidth: project.status === "blocked" ? 2 : 0.5,
         shadowBlur: 13,
         shadowColor: `${catColor(projectIndex)}99`,
       },
-    }));
+    }];
+    });
   });
   return (
     <Card title="研发星空" subtitle="每颗星代表某个项目在某一天留下的正式日报记录">
@@ -88,10 +100,9 @@ function ResearchStarfield({ data }: { data: DevelopmentResponse }) {
         backgroundColor: "transparent",
         grid: { left: 10, right: 16, top: 12, bottom: 18, containLabel: true },
         tooltip: { ...tooltipBase, formatter: (raw: unknown) => {
-          const item = raw as { data?: { nodes?: DevelopmentTaskNode[] } };
-          const nodes = item.data?.nodes ?? [];
-          if (!nodes.length) return "";
-          return `<b>${esc(nodes[0].date)} · ${esc(data.project_names[nodes[0].project_id] ?? nodes[0].project_id)}</b><br/>${nodes.length} 条日报事项${nodes.some((node) => node.status === "blocked") ? " · 含阻塞" : ""}<br/>${nodes.slice(0, 3).map((node) => `• ${esc(node.title)}`).join("<br/>")}`;
+          const item = raw as { data?: { date?: string; projectName?: string; count?: number } };
+          if (!item.data?.date) return "";
+          return `<b>${esc(item.data.date)} · ${esc(item.data.projectName)}</b><br/>${item.data.count ?? 0} 条日报事项`;
         } },
         xAxis: { type: "category", data: dates.map((date) => date.slice(5)), ...axisBase(), axisLabel: { color: C.ink3, rotate: dates.length > 25 ? 35 : 0 }, splitLine: { show: false } },
         yAxis: { type: "category", data: projects.map((item) => item.name), ...axisBase(), axisLabel: { color: C.ink2 }, splitLine: { lineStyle: { color: C.line, opacity: .22, type: "dashed" } } },
@@ -394,10 +405,11 @@ function PlanTrend({ data }: { data: DevelopmentResponse }) {
   );
 }
 
-function TimeTravel({ data }: { data: DevelopmentResponse }) {
-  const [index, setIndex] = useState(Math.max(0, data.time_travel.length - 1));
-  useEffect(() => setIndex(Math.max(0, data.time_travel.length - 1)), [data.time_travel.length]);
-  const snapshot = data.time_travel[index];
+function TimeTravel({ data, onOffset }: { data: DevelopmentHistoryResponse; onOffset: (value: number) => void }) {
+  const snapshots = [...data.items].reverse();
+  const [index, setIndex] = useState(Math.max(0, snapshots.length - 1));
+  useEffect(() => setIndex(Math.max(0, snapshots.length - 1)), [data.offset, snapshots.length]);
+  const snapshot = snapshots[index];
   return (
     <Card title="历史日报快照" subtitle="选择一个日期，只查看截至当天日报已经记录的任务、结果和阻塞">
       <Guide>这是日报视角的历史快照，不是当时 Git、机器和实验环境的完整复原，也不会用后来的结果改写过去。</Guide>
@@ -405,7 +417,7 @@ function TimeTravel({ data }: { data: DevelopmentResponse }) {
         <>
           <div className="mb-4 flex items-center gap-3">
             <span className="w-20 text-sm font-medium text-primary">{snapshot.date}</span>
-            <input type="range" min={0} max={Math.max(0, data.time_travel.length - 1)} value={index} onChange={(event) => setIndex(Number(event.target.value))} className="w-full accent-cyan-400" />
+            <input type="range" min={0} max={Math.max(0, snapshots.length - 1)} value={index} onChange={(event) => setIndex(Number(event.target.value))} className="w-full accent-cyan-400" />
           </div>
           <div className="grid gap-3 xl:grid-cols-2">
             {snapshot.projects.filter((item) => item.project_id !== "unassigned").map((item) => (
@@ -419,26 +431,69 @@ function TimeTravel({ data }: { data: DevelopmentResponse }) {
               </div>
             ))}
           </div>
+          <div className="mt-4 flex items-center justify-between text-xs text-ink3">
+            <button disabled={!data.has_more} onClick={() => onOffset(data.offset + data.limit)} className="rounded border border-line px-3 py-1.5 disabled:opacity-40">更早一页</button>
+            <span>第 {Math.floor(data.offset / data.limit) + 1} 页 · 共 {data.total} 个日期</span>
+            <button disabled={data.offset === 0} onClick={() => onOffset(Math.max(0, data.offset - data.limit))} className="rounded border border-line px-3 py-1.5 disabled:opacity-40">较新一页</button>
+          </div>
         </>
       )}
     </Card>
   );
 }
 
-function DevelopmentContent({ data, project, setProject, life }: {
-  data: DevelopmentResponse;
-  project: string;
-  setProject: (value: string) => void;
+function projectData(summary: DevelopmentSummaryResponse, detail: DevelopmentProjectResponse): DevelopmentResponse {
+  return {
+    generated_for: summary.generated_for, days: summary.days, source: summary.source,
+    report_count: summary.report_count, project_names: summary.project_names,
+    storylines: { [detail.project_id]: detail.storyline },
+    threads: { [detail.project_id]: detail.threads }, metrics: detail.metrics,
+    lifecycles: summary.lifecycles, effort_output: summary.effort_output,
+    activity: detail.activity,
+    plans: { counts: {}, items: [], daily: [], total: 0 },
+    knowledge: { nodes: [], edges: [], explanation: "" },
+    time_travel: detail.latest_snapshot ? [{
+      date: detail.latest_snapshot.date, projects: [detail.latest_snapshot.project],
+    }] : [],
+    explanation: detail.explanation,
+  };
+}
+
+function globalData(summary: DevelopmentSummaryResponse, global: DevelopmentGlobalResponse): DevelopmentResponse {
+  return {
+    generated_for: summary.generated_for, days: summary.days, source: summary.source,
+    report_count: summary.report_count, project_names: summary.project_names,
+    storylines: {}, threads: {}, metrics: [], lifecycles: summary.lifecycles,
+    effort_output: summary.effort_output, activity: summary.activity, plans: global.plans,
+    knowledge: { nodes: [], edges: [], explanation: "" }, time_travel: [],
+    explanation: global.explanation,
+  };
+}
+
+function DevelopmentContent({ summary, detail, life }: {
+  summary: DevelopmentSummaryResponse;
+  detail: DevelopmentProjectResponse;
   life?: LifeDashboard;
 }) {
-  const recentProject = [...data.lifecycles]
-    .filter((item) => item.project_id !== "unassigned" && data.storylines[item.project_id]?.length)
-    .sort((a, b) => b.last_activity.localeCompare(a.last_activity) || b.task_count - a.task_count)[0]?.project_id;
-  const active = data.storylines[project] ? project : (recentProject ?? Object.keys(data.storylines).find((id) => id !== "unassigned") ?? "");
-  useEffect(() => { if (project !== active && active) setProject(active); }, [active, project, setProject]);
-  const totalNodes = Object.values(data.storylines).reduce((sum, nodes) => sum + nodes.length, 0);
+  const [globalOpen, setGlobalOpen] = useState(false);
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const globalQuery = useQuery({
+    queryKey: ["development-global", summary.days],
+    queryFn: () => getDevelopmentGlobal(summary.days), enabled: globalOpen,
+  });
+  const historyQuery = useQuery({
+    queryKey: ["development-history", summary.days, historyOffset],
+    queryFn: () => getDevelopmentHistory(summary.days, historyOffset, 10), enabled: globalOpen,
+  });
+  const data = projectData(summary, detail);
+  const active = detail.project_id;
   return (
     <div className="space-y-4">
+      {summary.project_identity.unmapped_ids.length > 0 && (
+        <div className="rounded-lg border border-warning/25 bg-warning/5 px-4 py-3 text-xs leading-5 text-ink2">
+          有 {summary.project_identity.unmapped_ids.length} 个历史标签尚未登记，当前统一放在“未登记历史记录”，不会再冒充新项目。
+        </div>
+      )}
       <ProjectOverview data={data} project={active} />
       <details open className="group rounded-lg border border-primary/25 bg-card">
         <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-medium text-ink">
@@ -447,7 +502,7 @@ function DevelopmentContent({ data, project, setProject, life }: {
         </summary>
         <div className="space-y-4 border-t border-line px-4 py-4">
           <ProjectMetro data={data} project={active} />
-          <ResearchStarfield data={data} />
+          <ResearchStarfield data={globalData(summary, { generated_for: summary.generated_for, days: summary.days, plans: { counts: {}, items: [], daily: [], total: 0 }, explanation: summary.explanation })} />
           <GpuPetZoo life={life} />
         </div>
       </details>
@@ -458,22 +513,24 @@ function DevelopmentContent({ data, project, setProject, life }: {
       <MilestoneTimeline data={data} project={active} />
       <MetricMountain metrics={data.metrics} project={active} />
 
-      <details className="group rounded-lg border border-line bg-card">
+      <details className="group rounded-lg border border-line bg-card" onToggle={(event) => setGlobalOpen(event.currentTarget.open)}>
         <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-medium text-ink">
           <span>展开全局记录统计</span>
-          <span className="text-xs font-normal text-ink3">{data.report_count} 份日报 · {totalNodes} 个节点 · {data.lifecycles.length - Number(Boolean(data.storylines.unassigned))} 个项目　<span className="inline-block transition-transform group-open:rotate-180">⌄</span></span>
+          <span className="text-xs font-normal text-ink3">{summary.report_count} 份日报 · {summary.counts.nodes} 个节点 · {summary.counts.projects} 个项目　<span className="inline-block transition-transform group-open:rotate-180">⌄</span></span>
         </summary>
         <div className="space-y-4 border-t border-line px-4 py-4">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard label="正式日报" value={data.report_count} hint={`最近 ${data.days} 天`} />
-            <StatCard label="全部发展节点" value={totalNodes} hint="来自日报任务，不是内部事件" tone="primary" />
-            <StatCard label="明确指标点" value={data.metrics.length} hint="CER / WER / F1 / 延迟等" tone="good" />
-            <StatCard label="计划闭环记录" value={data.plans.total} hint="完成、阻塞、延后或未标明" />
+            <StatCard label="正式日报" value={summary.report_count} hint={`最近 ${summary.days} 天`} />
+            <StatCard label="全部发展节点" value={summary.counts.nodes} hint="来自日报任务，不是内部事件" tone="primary" />
+            <StatCard label="明确指标点" value={summary.counts.metrics} hint="CER / WER / F1 / 延迟等" tone="good" />
+            <StatCard label="计划闭环记录" value={summary.counts.plans} hint="完成、阻塞、延后或未标明" />
           </div>
-          <LifecycleChart data={data} />
-          <ActivityRiver data={data} />
-          <PlanTrend data={data} />
-          <TimeTravel data={data} />
+          <LifecycleChart data={globalData(summary, globalQuery.data ?? { generated_for: summary.generated_for, days: summary.days, plans: { counts: {}, items: [], daily: [], total: 0 }, explanation: summary.explanation })} />
+          <ActivityRiver data={globalData(summary, globalQuery.data ?? { generated_for: summary.generated_for, days: summary.days, plans: { counts: {}, items: [], daily: [], total: 0 }, explanation: summary.explanation })} />
+          {globalQuery.isLoading && <div className="text-xs text-ink3">正在加载计划统计…</div>}
+          {globalQuery.data && <PlanTrend data={globalData(summary, globalQuery.data)} />}
+          {historyQuery.isLoading && <div className="text-xs text-ink3">正在加载历史快照…</div>}
+          {historyQuery.data && <TimeTravel data={historyQuery.data} onOffset={setHistoryOffset} />}
         </div>
       </details>
     </div>
@@ -483,11 +540,19 @@ function DevelopmentContent({ data, project, setProject, life }: {
 export function Development() {
   const [days, setDays] = useState(90);
   const [project, setProject] = useState("");
-  const query = useQuery({ queryKey: ["development", days], queryFn: () => getDevelopment(days), refetchInterval: 5 * 60_000 });
+  const query = useQuery({ queryKey: ["development-summary", days], queryFn: () => getDevelopmentSummary(days), refetchInterval: 5 * 60_000 });
   const lifeQuery = useQuery({ queryKey: ["development-life"], queryFn: () => getLifeDashboard(), refetchInterval: 5 * 60_000 });
   const projectOptions = useMemo(() => [...(query.data?.lifecycles ?? [])]
-    .filter((item) => item.project_id !== "unassigned" && query.data?.storylines[item.project_id]?.length)
+    .filter((item) => item.project_id !== "unassigned" && item.task_count > 0)
     .sort((a, b) => b.last_activity.localeCompare(a.last_activity) || b.task_count - a.task_count), [query.data]);
+  const active = projectOptions.some((item) => item.project_id === project)
+    ? project : (projectOptions[0]?.project_id ?? "");
+  useEffect(() => { if (active && project !== active) setProject(active); }, [active, project]);
+  const projectQuery = useQuery({
+    queryKey: ["development-project", days, active],
+    queryFn: () => getDevelopmentProject(active, days), enabled: Boolean(active),
+    refetchInterval: 5 * 60_000,
+  });
   return (
     <div className="space-y-4">
       <PageHeader
@@ -506,7 +571,11 @@ export function Development() {
         <span className="font-medium text-ink">这页回答四个问题：</span>最近在做什么、已经得到什么、卡在哪里、下一步是什么。可读内容来自正式 Markdown 日报；Token 来自日报采集器，GPU 状态来自只读采样。
       </div>
       <QueryBoundary query={query} isEmpty={(data) => data.report_count === 0} emptyText="这段时间没有正式日报">
-        {(data) => <DevelopmentContent data={data} project={project} setProject={setProject} life={lifeQuery.data} />}
+        {(summary) => active ? (
+          <QueryBoundary query={projectQuery} isEmpty={(data) => data.timeline_total === 0} emptyText="这个项目还没有正式日报记录">
+            {(detail) => <DevelopmentContent summary={summary} detail={detail} life={lifeQuery.data} />}
+          </QueryBoundary>
+        ) : <EmptyState text="日报里还没有可识别的项目" />}
       </QueryBoundary>
     </div>
   );

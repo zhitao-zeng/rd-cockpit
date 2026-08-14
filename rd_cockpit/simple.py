@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 from .config import load_config
 from .ledger import Ledger
+from .project_identity import (
+    canonical_project_id, canonical_project_ids, canonicalize_report,
+    visible_project_names,
+)
 from .state import build_state, state_dict
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -61,6 +65,27 @@ def _latest_usage_rows(rows: list[Any]) -> list[Any]:
     return list(latest.values())
 
 
+def _current_usage_rows(
+    ledger: Ledger, *, since_day: str | None = None, until_day: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses, args = ["1=1"], []
+    if since_day:
+        clauses.append("activity_day>=?"); args.append(since_day)
+    if until_day:
+        clauses.append("activity_day<?"); args.append(until_day)
+    rows = ledger.db.execute(
+        f"SELECT * FROM current_session_usage WHERE {' AND '.join(clauses)}", args,
+    ).fetchall()
+    return [{
+        "event_id": f"live:{row['agent']}:{row['session_id']}",
+        "event_type": "agent_usage_observed", "source": row["source"],
+        "project_id": row["project_id"], "session_id": row["session_id"],
+        "occurred_at": row["occurred_at"], "ingested_at": row["updated_at"],
+        "payload_json": row["payload_json"], "status": "observed",
+        "dirty": None, "commit_sha": None,
+    } for row in rows]
+
+
 def _usage(rows: list[Any]) -> dict[str, Any]:
     agents: dict[str, dict[str, int]] = defaultdict(lambda: {"sessions": 0, "input_tokens": 0, "output_tokens": 0,
                                                               "cached_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0})
@@ -83,6 +108,9 @@ def _usage_work(rows: list[Any], *, limit: int = 16) -> list[str]:
 
 def daily_records(ledger: Ledger, home: Path, target: date, project: str | None = None) -> dict[str, Any]:
     start, end = _bounds(target); all_rows = ledger.events(since=start, until=end)
+    all_rows.extend(_current_usage_rows(
+        ledger, since_day=target.isoformat(), until_day=(target + timedelta(days=1)).isoformat(),
+    ))
     all_rows = [row for row in all_rows if row["event_type"] != "agent_usage_observed"] + _latest_usage_rows(all_rows)
     config = load_config(home / "config" / "projects.yaml")
     ids = [project] if project else sorted(config.get("projects", {}))
@@ -121,6 +149,9 @@ def analytics(ledger: Ledger, home: Path, *, days: int = 30) -> dict[str, Any]:
     end_date = date.today() + timedelta(days=1); start_date = end_date - timedelta(days=days)
     start, _ = _bounds(start_date); _, end = _bounds(end_date - timedelta(days=1))
     rows = ledger.events(since=start, until=end); buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    rows.extend(_current_usage_rows(
+        ledger, since_day=start_date.isoformat(), until_day=end_date.isoformat(),
+    ))
     visible_rows = [row for row in rows if row["event_type"] != "agent_usage_observed"] + _latest_usage_rows(rows)
     for row in visible_rows:
         try: day = datetime.fromisoformat(row["occurred_at"]).astimezone(LOCAL_TZ).date().isoformat()
@@ -142,7 +173,7 @@ def analytics(ledger: Ledger, home: Path, *, days: int = 30) -> dict[str, Any]:
     from .daily_source import iter_reports
     from .daily_supplement import available_supplement_dates, load_supplement
     report_dates: set[str] = set()
-    for report in iter_reports(since=start_date.isoformat()):
+    for report in iter_reports(since=start_date.isoformat(), cache_home=home):
         day = report.get("date")
         if not day or day >= end_date.isoformat():
             continue
@@ -199,7 +230,7 @@ def analytics(ledger: Ledger, home: Path, *, days: int = 30) -> dict[str, Any]:
                 item["tokens"] = 0
                 item["codex_tokens"] = 0
                 item["claude_tokens"] = 0
-        supplement = load_supplement(day)
+        supplement = report.get("_supplement") or load_supplement(day)
         if supplement["available"]:
             for project_usage in supplement["projects"]:
                 pid = project_usage["project_id"]
@@ -246,21 +277,78 @@ def analytics(ledger: Ledger, home: Path, *, days: int = 30) -> dict[str, Any]:
             item["tokens"] = project_usage["tokens"]
             item["codex_tokens"] = project_usage["codex_tokens"]
             item["claude_tokens"] = project_usage["claude_tokens"]
-    config = load_config(home / "config" / "projects.yaml")
-    names = {pid: cfg.get("name", pid) for pid, cfg in config.get("projects", {}).items()}
-    names.update({"asr_other": "ASR / 其他", "avatar_video": "视频生成与理解",
-                  "investment_research": "投资研究", "music_voice": "音乐与语音生成",
-                  "llm_inference": "LLM 推理服务", "research_tools": "研发工具",
-                  "infrastructure": "研发基础设施", "embodied_platform": "Embodied AI / 平台部署",
-                  "autonomous_driving": "自动驾驶工具链", "idol": "Idol 生成",
-                  "workspace": "项目文档与工作区", "router": "路由服务",
-                  "image_identify": "图像鉴伪 / Image Identify", "menu_translate": "菜单图片翻译",
-                  "image_generation": "图像生成 API"})
-    names["unassigned"] = "未按项目归属"
-    daily = sorted(buckets.values(), key=lambda item: (item["date"], item["project_id"]))
+    # Raw collectors and older reports can contain retired heuristic buckets.
+    # Merge them into the canonical registry before any chart sees them.
+    canonical: dict[tuple[str, str], dict[str, Any]] = {}
+    numeric_fields = (
+        "activities", "experiments", "conclusions", "tokens",
+        "codex_tokens", "claude_tokens",
+    )
+    for item in buckets.values():
+        project_id = canonical_project_id(item.get("project_id"), home)
+        target_item = canonical.setdefault((item["date"], project_id), {
+            "date": item["date"], "project_id": project_id,
+            **{field: 0 for field in numeric_fields},
+        })
+        for field in numeric_fields:
+            target_item[field] += item.get(field, 0) or 0
+    names = visible_project_names(home)
+    daily = sorted(canonical.values(), key=lambda item: (item["date"], item["project_id"]))
     totals = {"tokens": sum(item["tokens"] for item in daily), "activities": sum(item["activities"] for item in daily),
               "experiments": sum(item["experiments"] for item in daily), "conclusions": sum(item["conclusions"] for item in daily)}
+    activity_rows = ledger.db.execute(
+        "SELECT activity_day,source,session_id,project_key,semantic_kind,completed_count,"
+        "failed_count,total_duration_ms FROM agent_activity_rollups "
+        "WHERE activity_day>=? AND activity_day<?",
+        (start_date.isoformat(), end_date.isoformat()),
+    ).fetchall()
+    activity_daily: dict[str, dict[str, Any]] = {}
+    activity_projects: dict[str, dict[str, Any]] = {}
+    activity_sessions: set[tuple[str, str]] = set()
+    for row in activity_rows:
+        day = str(row["activity_day"])
+        project_id = canonical_project_id(row["project_key"], home)
+        completed = int(row["completed_count"] or 0)
+        failed = int(row["failed_count"] or 0)
+        duration_ms = int(row["total_duration_ms"] or 0)
+        session_key = (str(row["source"]), str(row["session_id"]))
+        activity_sessions.add(session_key)
+        day_item = activity_daily.setdefault(day, {
+            "date": day, "completed": 0, "failed": 0, "duration_minutes": 0.0,
+            "sessions": set(),
+        })
+        project_item = activity_projects.setdefault(project_id, {
+            "project_id": project_id, "name": names.get(project_id, project_id),
+            "completed": 0, "failed": 0, "duration_minutes": 0.0, "sessions": set(),
+        })
+        for item in (day_item, project_item):
+            item["completed"] += completed
+            item["failed"] += failed
+            item["duration_minutes"] += duration_ms / 60_000
+            item["sessions"].add(session_key)
+
+    def finish_activity(item: dict[str, Any]) -> dict[str, Any]:
+        return {**item, "duration_minutes": round(float(item["duration_minutes"]), 1),
+                "sessions": len(item["sessions"])}
+
+    activity_completed = sum(int(row["completed_count"] or 0) for row in activity_rows)
+    activity_failed = sum(int(row["failed_count"] or 0) for row in activity_rows)
+    activity_duration = sum(int(row["total_duration_ms"] or 0) for row in activity_rows)
+    agent_activity = {
+        "totals": {
+            "completed": activity_completed, "failed": activity_failed,
+            "duration_minutes": round(activity_duration / 60_000, 1),
+            "sessions": len(activity_sessions),
+        },
+        "daily": [finish_activity(item) for _, item in sorted(activity_daily.items())],
+        "projects": sorted(
+            (finish_activity(item) for item in activity_projects.values()),
+            key=lambda item: (-(item["completed"] + item["failed"]), item["project_id"]),
+        ),
+        "explanation": "来自 Codex / Claude Code 生命周期 Hook 的聚合计数；不展示原始工具事件，也不把操作次数当作工作质量。",
+    }
     return {"days": days, "daily": daily, "project_names": names, "totals": totals,
+            "agent_activity": agent_activity,
             "token_available": totals["tokens"] > 0,
             "token_note": None if totals["tokens"] else "尚未同步 Agent Token；运行 rd usage-sync 后显示。"}
 
@@ -324,10 +412,14 @@ def knowledge(ledger: Ledger, home: Path, project: str | None = None) -> dict[st
     hidden_task_results = 0
     deduplicated = 0
     from .daily_source import _project_ids, iter_reports
-    for report in iter_reports():
+    for source_report in iter_reports(cache_home=home):
+        report = canonicalize_report(source_report, home)
         explicit_claims: list[str] = []
         for text in report.get("knowledge") or []:
-            project_ids = _claim_project_ids(text, _project_ids, report) or [None]
+            project_ids = canonical_project_ids(
+                _claim_project_ids(text, _project_ids, report), home,
+                default_unassigned=False,
+            ) or [None]
             if project and project not in project_ids:
                 continue
             title, detail = _claim_parts(text)
@@ -337,7 +429,10 @@ def knowledge(ledger: Ledger, home: Path, project: str | None = None) -> dict[st
                            "_claim": text})
             explicit_claims.append(text)
         for text in report.get("decisions") or []:
-            project_ids = _claim_project_ids(text, _project_ids, report) or [None]
+            project_ids = canonical_project_ids(
+                _claim_project_ids(text, _project_ids, report), home,
+                default_unassigned=False,
+            ) or [None]
             if project and project not in project_ids:
                 continue
             title, detail = _claim_parts(text)
@@ -370,12 +465,12 @@ def knowledge(ledger: Ledger, home: Path, project: str | None = None) -> dict[st
     for row in ledger.events(project_id=project):
         p = _payload(row); typ = row["event_type"]
         if typ.startswith("decision_") and p.get("text"):
-            output.append({"project_id": row["project_id"], "kind": "研究决策", "title": p["text"],
+            output.append({"project_id": canonical_project_id(row["project_id"], home), "kind": "研究决策", "title": p["text"],
                            "detail": p.get("reason"), "scope": p.get("scope"), "date": row["occurred_at"][:10],
                            "confidence": "已确认" if row["verification"] == "user_confirmed" else "待确认",
                            "_claim": p["text"]})
         elif typ.startswith("hypothesis_") and p.get("statement"):
-            output.append({"project_id": row["project_id"], "kind": "假设", "title": p["statement"],
+            output.append({"project_id": canonical_project_id(row["project_id"], home), "kind": "假设", "title": p["statement"],
                            "detail": p.get("classification"), "scope": p.get("scope"), "date": row["occurred_at"][:10],
                            "confidence": "研究中", "_claim": p["statement"]})
 

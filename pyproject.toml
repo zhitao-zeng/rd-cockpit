@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +7,12 @@ name = "rd-cockpit"
 version = "0.1.0"
 description = "A local, evidence-first R&D state ledger and handoff CLI"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 readme = "README.md"
 keywords = ["research", "developer-tools", "daily-report", "codex", "claude-code"]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
@@ -23,10 +23,13 @@ dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]
 server = ["fastapi>=0.110", "uvicorn>=0.29"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx2>=2,<3"]
 
 [project.scripts]
 rd = "rd_cockpit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rd_cockpit", "rd_cockpit.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

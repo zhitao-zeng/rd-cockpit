@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily R&D Cockpit verified backup and data retention
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=rd-cockpit-maintenance.service
+
+[Install]
+WantedBy=timers.target

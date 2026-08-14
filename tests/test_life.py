@@ -40,7 +40,7 @@ fun:
     monkeypatch.setattr(life, "available_report_dates", lambda: ["2026-08-01", "2026-08-02"])
     monkeypatch.setattr(life, "available_supplement_dates", lambda: [])
     monkeypatch.setattr(life, "load_report", lambda report_date=None: latest if report_date is None else {"available": False})
-    monkeypatch.setattr(life, "iter_reports", lambda: [latest])
+    monkeypatch.setattr(life, "iter_reports", lambda **_: [latest])
 
     ledger = Ledger(tmp_path / ".rd-cockpit" / "events.sqlite")
     now = datetime(2026, 8, 3, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -68,7 +68,7 @@ def test_life_dashboard_marks_unknown_personal_values_instead_of_guessing(tmp_pa
     monkeypatch.setattr(life, "available_report_dates", lambda: [])
     monkeypatch.setattr(life, "available_supplement_dates", lambda: [])
     monkeypatch.setattr(life, "load_report", lambda report_date=None: {"available": False, "token": {}})
-    monkeypatch.setattr(life, "iter_reports", lambda: [])
+    monkeypatch.setattr(life, "iter_reports", lambda **_: [])
     ledger = Ledger(tmp_path / ".rd-cockpit" / "events.sqlite")
 
     result = life.life_dashboard(ledger, tmp_path, date(2026, 8, 3))
@@ -89,7 +89,7 @@ def test_last_day_payday_and_explicit_remaining_leave(tmp_path: Path, monkeypatc
     monkeypatch.setattr(life, "available_report_dates", lambda: [])
     monkeypatch.setattr(life, "available_supplement_dates", lambda: [])
     monkeypatch.setattr(life, "load_report", lambda report_date=None: {"available": False, "token": {}})
-    monkeypatch.setattr(life, "iter_reports", lambda: [])
+    monkeypatch.setattr(life, "iter_reports", lambda **_: [])
     ledger = Ledger(tmp_path / ".rd-cockpit" / "events.sqlite")
 
     result = life.life_dashboard(ledger, tmp_path, date(2026, 8, 3))
@@ -102,7 +102,7 @@ def test_last_day_payday_and_explicit_remaining_leave(tmp_path: Path, monkeypatc
 
 
 def test_random_knowledge_does_not_promote_ordinary_task_results(monkeypatch) -> None:
-    monkeypatch.setattr(life, "iter_reports", lambda: [{
+    monkeypatch.setattr(life, "iter_reports", lambda **_: [{
         "date": "2026-08-03",
         "knowledge": [],
         "groups": [{"tasks": [{
@@ -117,7 +117,7 @@ def test_random_knowledge_does_not_promote_ordinary_task_results(monkeypatch) ->
 
 
 def test_random_knowledge_accepts_explicit_task_conclusions(monkeypatch) -> None:
-    monkeypatch.setattr(life, "iter_reports", lambda: [{
+    monkeypatch.setattr(life, "iter_reports", lambda **_: [{
         "date": "2026-08-03",
         "knowledge": [],
         "groups": [{"tasks": [{

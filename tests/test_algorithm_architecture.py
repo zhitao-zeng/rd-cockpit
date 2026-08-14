@@ -212,7 +212,7 @@ def test_analyze_project_caches_same_source_hash(tmp_path: Path, monkeypatch) ->
     home, _ = _home(tmp_path)
     calls: list[str] = []
 
-    def fake_request(model, instruction, repo):
+    def fake_request(model, instruction, repo, **_kwargs):
         calls.append(model)
         bundle = build_evidence_bundle(home, "demo")
         return _raw(bundle), {"model": model, "provider": "fake", "usage": {}}
@@ -226,6 +226,32 @@ def test_analyze_project_caches_same_source_hash(tmp_path: Path, monkeypatch) ->
     assert second["cache_hit"] is True
     assert calls == ["codex:gpt-5.6-sol@medium"]
     assert architecture_index(home)["counts"]["ready"] == 1
+
+
+def test_unrelated_git_commit_does_not_invalidate_algorithm_snapshot(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home, repo = _home(tmp_path)
+    calls: list[str] = []
+
+    def fake_request(model, instruction, selected_repo, **_kwargs):
+        calls.append(model)
+        return _raw(build_evidence_bundle(home, "demo")), {
+            "model": model, "provider": "fake", "usage": {},
+        }
+
+    monkeypatch.setattr("rd_cockpit.algorithm_architecture._request_model", fake_request)
+    analyze_project(home, "demo")
+    (repo / "release-notes.txt").write_text("packaging only\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "release-notes.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "-qm", "docs: packaging note"], check=True,
+    )
+
+    second = analyze_project(home, "demo")
+    assert second["refresh_action"] == "cache_hit"
+    assert calls == ["codex:gpt-5.6-sol@medium"]
 
 
 def test_validation_rejects_cross_project_output(tmp_path: Path) -> None:
@@ -249,7 +275,7 @@ def test_read_only_api_serves_snapshot_without_absolute_source_roots(tmp_path: P
         encoding="utf-8",
     )
 
-    def fake_request(model, instruction, selected_repo):
+    def fake_request(model, instruction, selected_repo, **_kwargs):
         bundle = build_evidence_bundle(home, "demo")
         return _raw(bundle), {"model": model, "provider": "fake", "usage": {}}
 

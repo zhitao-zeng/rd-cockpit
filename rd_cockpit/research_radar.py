@@ -11,14 +11,17 @@ from __future__ import annotations
 import json
 import os
 import html
+import hashlib
 import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from .artifact_cache import atomic_write_json
+from .model_runner import run_claude_json
 
 from .config import load_config
 from .daily_source import load_report
@@ -78,10 +81,7 @@ def _load_cache(path: Path) -> dict[str, Any] | None:
 
 
 def _write_cache(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, value)
 
 
 def _radar_topics(config: dict[str, Any], project: str | None = None) -> list[dict[str, Any]]:
@@ -336,33 +336,10 @@ def _normalize_work(
     }
 
 
-def _json_object(text: str) -> dict[str, Any]:
-    value = text.strip()
-    if value.startswith("```"):
-        value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.IGNORECASE | re.DOTALL).strip()
-    try:
-        parsed = json.loads(value)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(value):
-        if character != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(value[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    raise ValueError("summary model output does not contain a JSON object")
-
-
 def _request_chinese_summaries(
     papers: list[dict[str, Any]], model: str, *, timeout: float = DEFAULT_SUMMARY_TIMEOUT,
+    home: Path | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    endpoint = os.environ.get("RD_RADAR_LLM_URL", "http://127.0.0.1:4000/v1/messages")
     system = (
         "你是个人科研雷达的中文论文编辑。只根据给定标题、摘要和项目上下文生成中文速读，"
         "禁止补充输入中没有的方法、指标或结论。输出 JSON，不要 Markdown。专业术语可保留英文括注。"
@@ -397,32 +374,21 @@ def _request_chinese_summaries(
         },
         "papers": compact,
     }
-    payload = {
-        "model": model,
-        "max_tokens": min(12000, max(1600, len(papers) * 650)),
-        "temperature": 0.1,
-        "stream": False,
-        "system": system,
-        "messages": [{"role": "user", "content": json.dumps(instruction, ensure_ascii=False)}],
-    }
-    request = Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-api-key": "local-router",
-                 "anthropic-version": "2023-06-01"},
-        method="POST",
+    project_ids = sorted({str(item.get("project_id") or "") for item in papers if item.get("project_id")})
+    parsed, metadata = run_claude_json(
+        model, instruction, prompt=system,
+        executable_env="RD_RADAR_CLAUDE_BIN", timeout_env="RD_RADAR_SUMMARY_TIMEOUT",
+        default_timeout=timeout,
+        run_context={
+            "home": home or os.environ.get("RD_COCKPIT_HOME"), "stage": "research_radar",
+            "project_id": project_ids[0] if len(project_ids) == 1 else None,
+            "source_hash": hashlib.sha256(
+                json.dumps(compact, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "fallback_used": model != os.environ.get("RD_RADAR_SUMMARY_MODEL", "deepseek-local").strip(),
+            "reason": "论文候选发生变化，需要生成中文速读。",
+        },
     )
-    try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - configurable localhost router
-            outer = json.load(response)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-    content = outer.get("content") if isinstance(outer, dict) else None
-    text = "".join(
-        str(block.get("text") or "") for block in content or []
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    parsed = _json_object(text)
     expected = {str(item["id"]) for item in papers}
     results: dict[str, dict[str, Any]] = {}
     for raw in parsed.get("papers") or []:
@@ -443,11 +409,11 @@ def _request_chinese_summaries(
         }
     if not results:
         raise ValueError("summary model returned no usable paper summaries")
-    usage = outer.get("usage") if isinstance(outer, dict) and isinstance(outer.get("usage"), dict) else {}
-    return results, {"model": model, "usage": usage}
+    return results, {"model": model, "usage": metadata.get("usage") or {},
+                     "provider": metadata.get("provider")}
 
 
-def _summarize_papers(papers: list[dict[str, Any]]) -> SummaryResult:
+def _summarize_papers(papers: list[dict[str, Any]], *, home: Path | None = None) -> SummaryResult:
     primary = os.environ.get("RD_RADAR_SUMMARY_MODEL", "deepseek-local").strip()
     fallback = os.environ.get("RD_RADAR_SUMMARY_FALLBACK_MODEL", "deepseek").strip()
     models = list(dict.fromkeys(value for value in (primary, fallback) if value))
@@ -459,7 +425,7 @@ def _summarize_papers(papers: list[dict[str, Any]]) -> SummaryResult:
         if not remaining:
             break
         try:
-            values, metadata = _request_chinese_summaries(remaining, model)
+            values, metadata = _request_chinese_summaries(remaining, model, home=home)
         except Exception as exc:
             attempts.append({"model": model, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
             continue
@@ -591,9 +557,68 @@ def _filtered(value: dict[str, Any], project: str | None) -> dict[str, Any]:
     if not project:
         return output
     output["items"] = [item for item in value.get("items", []) if item.get("project_id") == project]
-    output["projects"] = {key: item for key, item in value.get("projects", {}).items() if key == project}
     output["item_count"] = len(output["items"])
     return output
+
+
+def read_research_radar(
+    home: Path, project: str | None = None, *, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Read the last radar snapshot without network or model side effects."""
+    config = load_config(home / "config" / "projects.yaml")
+    if project and project not in config.get("projects", {}):
+        raise KeyError(project)
+    current = _iso_now(now)
+    cached = _load_cache(_cache_path(home))
+    if not cached:
+        projects = {
+            topic["project_id"]: {
+                "name": topic["project_name"], "topics": [], "result_count": 0,
+            }
+            for topic in _radar_topics(config)
+        }
+        for topic in _radar_topics(config):
+            projects[topic["project_id"]]["topics"].append(topic["label"])
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": None,
+            "expires_at": None,
+            "source": "OpenAlex",
+            "source_url": "https://openalex.org/",
+            "lookback_days": DEFAULT_LOOKBACK_DAYS,
+            "cache_hours": DEFAULT_CACHE_HOURS,
+            "cached": True,
+            "stale": True,
+            "projects": projects,
+            "items": [],
+            "item_count": 0,
+            "selection": {
+                "candidate_count": 0, "eligible_count": 0, "excluded_count": 0,
+                "new_item_count": 0, "retained_anchor_count": 0,
+                "per_project": DEFAULT_ITEMS_PER_PROJECT,
+                "minimum_score": MINIMUM_RECOMMENDATION_SCORE,
+                "method": "等待后台首次更新。",
+            },
+            "warnings": ["论文雷达尚无本地快照；后台刷新完成后会自动出现。"],
+            "summary_generation": {
+                "generated_count": 0, "reused_count": 0, "missing_count": 0,
+                "attempts": [], "fallback_used": False,
+            },
+            "explanation": "浏览页面只读取本地快照，不会联网或调用模型。",
+        }
+    result = dict(cached)
+    result["cached"] = True
+    try:
+        expires = datetime.fromisoformat(str(cached.get("expires_at") or ""))
+        result["stale"] = expires <= current
+    except (TypeError, ValueError):
+        result["stale"] = True
+    if result["stale"]:
+        result["warnings"] = [
+            *(cached.get("warnings") or []),
+            "本地论文快照已超过计划刷新时间；页面仍显示最后一次成功结果。",
+        ]
+    return _filtered(result, project)
 
 
 def research_radar(
@@ -697,7 +722,8 @@ def research_radar(
     }
     if pending_summaries:
         try:
-            values, summary_generation, summary_warnings = (summarizer or _summarize_papers)(pending_summaries)
+            summary_fn = summarizer or (lambda values: _summarize_papers(values, home=home))
+            values, summary_generation, summary_warnings = summary_fn(pending_summaries)
             summary_generation["reused_count"] = reused_summaries
             warnings.extend(summary_warnings)
             for item in pending_summaries:

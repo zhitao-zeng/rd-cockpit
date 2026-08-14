@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime, timezone
 
 from rd_cockpit.ledger import Ledger
 from rd_cockpit.simple import _usage, analytics, daily_records, knowledge
@@ -91,7 +91,7 @@ def test_knowledge_hides_progress_results_and_keeps_explicit_claims(
             }],
         }],
     }
-    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda: iter([report]))
+    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda **_: iter([report]))
     monkeypatch.setattr("rd_cockpit.daily_source._project_ids", lambda text: ["ocr"])
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "projects.yaml").write_text("projects: {}\n", encoding="utf-8")
@@ -114,13 +114,20 @@ def test_knowledge_hides_progress_results_and_keeps_explicit_claims(
 def test_knowledge_prefers_named_product_over_generic_asr_dependency(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    (tmp_path / "config").mkdir()
+    config = tmp_path / "config" / "projects.yaml"
+    config.write_text(
+        "projects:\n  asr:\n    name: ASR\n  avatar_video:\n    name: Avatar Video\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
     report = {
         "date": "2026-08-09",
         "knowledge": ["video-generator 提交需接通真实媒体、TTS 和 ASR 后端。"],
         "decisions": [],
         "groups": [],
     }
-    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda: iter([report]))
+    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda **_: iter([report]))
     monkeypatch.setattr(
         "rd_cockpit.daily_source._project_ids",
         lambda text: ["asr_other", "avatar_video"],
@@ -136,6 +143,10 @@ def test_knowledge_prefers_named_product_over_generic_asr_dependency(
 def test_knowledge_infers_project_from_matching_task_conclusion(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    (tmp_path / "config").mkdir()
+    config = tmp_path / "config" / "projects.yaml"
+    config.write_text("projects:\n  ocr:\n    name: OCR\n", encoding="utf-8")
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
     claim = "降低检测阈值只会增加误检"
     report = {
         "date": "2026-08-09",
@@ -152,7 +163,7 @@ def test_knowledge_infers_project_from_matching_task_conclusion(
             }],
         }],
     }
-    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda: iter([report]))
+    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda **_: iter([report]))
     monkeypatch.setattr("rd_cockpit.daily_source._project_ids", lambda text: [])
     ledger = Ledger(tmp_path / "events.sqlite")
 
@@ -193,7 +204,10 @@ def test_analytics_counts_explicit_claims_not_ordinary_results(
         lambda day: {"available": False, "projects": []},
     )
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "projects.yaml").write_text("projects: {}\n", encoding="utf-8")
+    (tmp_path / "config" / "projects.yaml").write_text(
+        "projects:\n  ocr:\n    name: OCR\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(tmp_path / "config" / "projects.yaml"))
     ledger = Ledger(tmp_path / ".rd-cockpit" / "events.sqlite")
 
     result = analytics(ledger, tmp_path, days=30)
@@ -201,4 +215,37 @@ def test_analytics_counts_explicit_claims_not_ordinary_results(
 
     assert ocr["activities"] == 1
     assert ocr["conclusions"] == 3
+    ledger.close()
+
+
+def test_analytics_exposes_only_aggregated_agent_lifecycle_activity(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "projects.yaml").write_text(
+        "projects:\n  demo:\n    name: Demo\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(tmp_path / "config" / "projects.yaml"))
+    monkeypatch.setattr("rd_cockpit.daily_source.iter_reports", lambda **_: iter([]))
+    monkeypatch.setattr("rd_cockpit.daily_supplement.available_supplement_dates", lambda: [])
+    ledger = Ledger(tmp_path / ".rd-cockpit" / "events.sqlite")
+    stamp = datetime.now(timezone.utc).isoformat()
+    ledger.record_agent_activity(
+        source="codex", session_id="session-1", project_id="demo",
+        semantic_kind="command", failed=False, duration_ms=90_000,
+        occurred_at=stamp, activity_key="one",
+    )
+    ledger.record_agent_activity(
+        source="codex", session_id="session-1", project_id="demo",
+        semantic_kind="command", failed=True, duration_ms=30_000,
+        occurred_at=stamp, activity_key="two",
+    )
+
+    result = analytics(ledger, tmp_path, days=7)
+
+    assert result["agent_activity"]["totals"] == {
+        "completed": 1, "failed": 1, "duration_minutes": 2.0, "sessions": 1,
+    }
+    assert result["agent_activity"]["projects"][0]["project_id"] == "demo"
+    assert "session_id" not in result["agent_activity"]["projects"][0]
     ledger.close()

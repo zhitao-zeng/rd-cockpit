@@ -1,0 +1,14 @@
+[Unit]
+Description=R&D Cockpit web interface
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+EnvironmentFile=-%h/.config/rd-cockpit/env
+ExecStart=@PYTHON@ -m rd_cockpit --home @ROOT@ serve-web --host @WEB_HOST@ --port 4016 --dist @ROOT@/frontend/dist
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

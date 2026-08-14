@@ -14,16 +14,17 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .artifact_cache import atomic_write_json
 from .config import load_config, project_config
 from .daily_source import report_directories
 from .model_evidence import evidence_for_project
+from .model_runner import run_claude_json, run_codex_json
+from .model_runs import record_cache_decision
 from .security import redact_text
-from .runtime import executable as resolve_executable
 
 
 SCHEMA_VERSION = 2
@@ -83,10 +84,7 @@ def _utc_now() -> str:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    atomic_write_json(path, value)
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -321,7 +319,9 @@ def _source_evidence(source: Mapping[str, Any]) -> list[dict[str, Any]]:
             evidence.append({
                 "ref": f"source:{source['id']}:{relative}:L{start}-L{end}",
                 "source_id": source["id"], "path": relative, "line_start": start,
-                "line_end": end, "sha256": file_hash, "kind": "source", "text": text,
+                "line_end": end, "sha256": file_hash,
+                "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "kind": "source", "text": text,
             })
             total_bytes += encoded
     return evidence
@@ -369,6 +369,7 @@ def _report_evidence(
         if text:
             output.append({"ref": ref, "source_id": "daily_report", "path": path.name,
                            "line_start": start, "line_end": end, "sha256": _sha256(path),
+                           "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                            "kind": "report", "text": text})
         if len(output) >= 36:
             break
@@ -398,18 +399,43 @@ def build_evidence_bundle(
                     "kind": "local", "exists": Path(item["root"]).is_dir()} for item in sources]
     source_meta.extend({**item, "kind": "external", "exists": True} for item in external_sources)
     state = _git_state(repo)
-    fingerprint_payload = {
+    # ``legacy_source_hash`` exactly mirrors schema v2's broad invalidation so
+    # existing snapshots can migrate without one unnecessary model call.
+    legacy_fingerprint_payload = {
         "project_id": project_id, "state": state,
         "evidence": [(item["ref"], item["sha256"]) for item in evidence],
     }
-    source_hash = hashlib.sha256(
-        json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    legacy_source_hash = hashlib.sha256(
+        json.dumps(legacy_fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+    by_kind: dict[str, list[tuple[str, str]]] = {"source": [], "report": [], "external": []}
+    for item in evidence:
+        kind = str(item.get("kind") or "source")
+        digest = str(item.get("content_sha256") or hashlib.sha256(
+            str(item.get("text") or "").encode("utf-8")
+        ).hexdigest())
+        by_kind.setdefault(kind, []).append((str(item["ref"]), digest))
+
+    def digest(items: list[tuple[str, str]]) -> str:
+        return hashlib.sha256(json.dumps(sorted(items), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    component_hashes = {f"{kind}_hash": digest(items) for kind, items in by_kind.items()}
+    # HEAD, branch, timestamps and whole-file hashes are intentionally absent.
+    # Only the exact algorithm/report excerpts supplied to the analyzer may
+    # invalidate its semantic result.
+    analysis_hash = digest([
+        ("project", project_id),
+        *[(name, value) for name, value in sorted(component_hashes.items())],
+    ])
     return {
         "schema_version": SCHEMA_VERSION,
         "project": {"id": project_id, "name": str(config.get("name") or project_id),
                     "priority": str(config.get("priority") or ""), "repo_path": str(repo)},
-        "source_state": {**state, "source_hash": source_hash},
+        "source_state": {
+            **state, **component_hashes, "analysis_hash": analysis_hash,
+            "source_hash": analysis_hash, "legacy_source_hash": legacy_source_hash,
+            "fingerprint_version": 3,
+        },
         "sources": source_meta,
         "evidence": evidence,
         "limits": {"evidence_items": len(evidence), "max_items": MAX_EVIDENCE_ITEMS,
@@ -518,71 +544,40 @@ def _instruction(bundle: dict[str, Any], previous: Mapping[str, Any] | None = No
     return instruction
 
 
-def _request_codex(model_spec: str, instruction: dict[str, Any], repo: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    model_and_effort = model_spec.removeprefix("codex:")
-    model, separator, reasoning = model_and_effort.partition("@")
-    reasoning = reasoning if separator else "medium"
-    executable = resolve_executable("RD_ALGORITHM_CODEX_BIN", "codex")
-    timeout = float(os.environ.get("RD_ALGORITHM_MODEL_TIMEOUT", "1200"))
+def _request_codex(
+    model_spec: str, instruction: dict[str, Any], repo: Path, *, run_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prompt = (
         "你是算法架构审计器。严格根据标准输入中的 evidence_catalog 生成当前算法方案、模型剖面和方案演化，"
         "遵守 output_schema 与 rules，只输出 JSON。不要使用常识补全证据中不存在的网络结构或指标。"
     )
-    with tempfile.TemporaryDirectory(prefix="rd-algorithm-") as temporary:
-        message = Path(temporary) / "message.json"
-        command = [
-            executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--skip-git-repo-check", "--sandbox", "read-only", "--model", model,
-            "-c", 'model_provider="openai"', "-c", f'model_reasoning_effort="{reasoning}"',
-            # Run away from every source repository.  The model receives the
-            # bounded evidence catalog through stdin and has no project path to
-            # explore, making the supplied catalog the only intended source.
-            "-C", temporary,
-            "--json", "--output-last-message", str(message), prompt,
-        ]
-        try:
-            completed = subprocess.run(
-                command, input=json.dumps(instruction, ensure_ascii=False), text=True,
-                capture_output=True, timeout=timeout, check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError(f"Codex request failed: {exc}") from exc
-        if completed.returncode:
-            raise RuntimeError(f"Codex exited with {completed.returncode}: {completed.stderr[-500:]}")
-        result = _json_object(message.read_text(encoding="utf-8", errors="replace"))
-        usage: dict[str, Any] = {}
-        for line in completed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-                usage = event["usage"]
-    return result, {"model": model_spec, "provider": "codex-cli", "reasoning_effort": reasoning, "usage": usage}
+    # No workdir is supplied deliberately: architecture analysis receives a
+    # bounded evidence catalog and cannot roam through the source repository.
+    return run_codex_json(
+        model_spec, instruction, prompt=prompt, executable_env="RD_ALGORITHM_CODEX_BIN",
+        timeout_env="RD_ALGORITHM_MODEL_TIMEOUT", default_timeout=1200,
+        temp_prefix="rd-algorithm-",
+        run_context=run_context,
+    )
 
 
-def _request_claude(model: str, instruction: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    executable = os.environ.get("RD_ALGORITHM_CLAUDE_BIN", "claude")
-    timeout = float(os.environ.get("RD_ALGORITHM_MODEL_TIMEOUT", "1200"))
+def _request_claude(
+    model: str, instruction: dict[str, Any], *, run_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prompt = "你是算法架构审计器。只按输入 schema 与证据目录返回纯 JSON，不得补写无证据模型结构。"
-    command = [executable, "-p", prompt, "--model", model, "--tools", "", "--disable-slash-commands",
-               "--no-session-persistence", "--output-format", "json"]
-    try:
-        completed = subprocess.run(command, input=json.dumps(instruction, ensure_ascii=False), text=True,
-                                   capture_output=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Claude route failed: {exc}") from exc
-    if completed.returncode:
-        raise RuntimeError(f"Claude route exited with {completed.returncode}: {completed.stderr[-500:]}")
-    outer = _json_object(completed.stdout)
-    value = outer.get("result", outer)
-    result = value if isinstance(value, dict) else _json_object(str(value))
-    return result, {"model": model, "provider": "claude-router",
-                    "usage": outer.get("usage") if isinstance(outer.get("usage"), dict) else {}}
+    return run_claude_json(
+        model, instruction, prompt=prompt, executable_env="RD_ALGORITHM_CLAUDE_BIN",
+        timeout_env="RD_ALGORITHM_MODEL_TIMEOUT", default_timeout=1200,
+        run_context=run_context,
+    )
 
 
-def _request_model(model: str, instruction: dict[str, Any], repo: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    return _request_codex(model, instruction, repo) if model.startswith("codex:") else _request_claude(model, instruction)
+def _request_model(
+    model: str, instruction: dict[str, Any], repo: Path, *, run_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (_request_codex(model, instruction, repo, run_context=run_context)
+            if model.startswith("codex:")
+            else _request_claude(model, instruction, run_context=run_context))
 
 
 def _evidence_refs(value: Any, catalog: Mapping[str, dict[str, Any]], label: str) -> tuple[list[str], list[str]]:
@@ -935,39 +930,89 @@ def analyze_project(
     home: Path, project_id: str, *, model: str = DEFAULT_MODEL,
     fallback_model: str = DEFAULT_FALLBACK_MODEL, force: bool = False,
     _intelligence: Mapping[str, Any] | None = None,
+    max_model_attempts: int | None = None,
 ) -> dict[str, Any]:
     bundle = build_evidence_bundle(home, project_id, intelligence=_intelligence)
     latest = load_snapshot(home, project_id)
-    if (not force and latest and latest.get("schema_version") == SCHEMA_VERSION
-            and (latest.get("source_state") or {}).get("source_hash") == bundle["source_state"]["source_hash"]):
+    latest_state = (latest or {}).get("source_state") or {}
+    current_state = bundle["source_state"]
+    exact_hit = latest_state.get("analysis_hash") == current_state["analysis_hash"]
+    legacy_hit = latest_state.get("source_hash") == current_state["legacy_source_hash"]
+    if not force and latest and latest.get("schema_version") == SCHEMA_VERSION and (exact_hit or legacy_hit):
+        if legacy_hit and not exact_hit:
+            latest = dict(latest)
+            latest["source_state"] = current_state
+            _write_json(_latest_path(home, project_id), latest)
+            if latest.get("snapshot_id"):
+                _write_json(_snapshot_root(home, project_id) / f"{latest['snapshot_id']}.json", latest)
         latest = _hydrate_snapshot_evidence(home, latest, bundle)
-        return {**latest, "cache_hit": True}
+        record_cache_decision(
+            home, stage="architecture", project_id=project_id,
+            source_hash=current_state["analysis_hash"], model=model, status="cached",
+            reason="算法相关证据未变化；复用已验证快照。",
+        )
+        return {**latest, "cache_hit": True, "refresh_action": "cache_hit", "model_attempts": 0}
     if len(bundle["evidence"]) < 2:
-        return _store_snapshot(home, _insufficient_snapshot(bundle, "项目中没有足够的算法、模型或评测证据。"))
+        stored = _store_snapshot(home, _insufficient_snapshot(bundle, "项目中没有足够的算法、模型或评测证据。"))
+        record_cache_decision(
+            home, stage="architecture", project_id=project_id,
+            source_hash=current_state["analysis_hash"], model=model, status="skipped",
+            reason="算法证据不足，未调用模型。",
+        )
+        return {**stored, "cache_hit": False, "refresh_action": "insufficient", "model_attempts": 0}
+    if max_model_attempts is not None and max_model_attempts <= 0:
+        record_cache_decision(
+            home, stage="architecture", project_id=project_id,
+            source_hash=current_state["analysis_hash"], model=model, status="deferred",
+            reason="本轮模型调用预算已用完；保留旧快照并延后刷新。",
+        )
+        if latest:
+            return {**latest, "cache_hit": True, "refresh_action": "deferred",
+                    "refresh_deferred": True, "model_attempts": 0}
+        deferred = _insufficient_snapshot(bundle, "等待下一轮架构分析预算。")
+        return {**deferred, "cache_hit": False, "refresh_action": "deferred",
+                "refresh_deferred": True, "model_attempts": 0}
 
     repo = Path(bundle["project"]["repo_path"])
     errors = []
-    for selected in dict.fromkeys([model, fallback_model]):
+    attempts = 0
+    for selected_index, selected in enumerate(dict.fromkeys([model, fallback_model])):
         if not selected:
             continue
+        if max_model_attempts is not None and attempts >= max_model_attempts:
+            break
+        attempts += 1
         try:
-            raw, metadata = _request_model(selected, _instruction(bundle, latest), repo)
+            raw, metadata = _request_model(
+                selected, _instruction(bundle, latest), repo,
+                run_context={
+                    "home": home, "stage": "architecture", "project_id": project_id,
+                    "source_hash": current_state["analysis_hash"],
+                    "fallback_used": selected_index > 0,
+                    "reason": "算法相关代码、配置、日报证据或公开模型参考发生变化。",
+                },
+            )
             snapshot = validate_snapshot(raw, bundle, metadata)
-            return _store_snapshot(home, snapshot)
+            stored = _store_snapshot(home, snapshot)
+            return {**stored, "cache_hit": False, "refresh_action": "analyzed",
+                    "model_attempts": attempts}
         except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
             errors.append({"model": selected, "error": str(exc)})
     failed = _insufficient_snapshot(bundle, "模型分析失败，已保留上一个可用快照。")
     failed["status"] = "analysis_failed"
     failed["model_run"] = {"provider": "failed", "model": model, "usage": {}, "errors": errors}
     if latest:
-        return {**latest, "refresh_error": errors, "cache_hit": True}
-    return _store_snapshot(home, failed)
+        return {**latest, "refresh_error": errors, "cache_hit": True,
+                "refresh_action": "failed", "model_attempts": attempts}
+    stored = _store_snapshot(home, failed)
+    return {**stored, "cache_hit": False, "refresh_action": "failed", "model_attempts": attempts}
 
 
 def analyze_all(
     home: Path, *, project_ids: list[str] | None = None, model: str = DEFAULT_MODEL,
     fallback_model: str = DEFAULT_FALLBACK_MODEL, force: bool = False,
     progress: Callable[[str], None] | None = None,
+    max_model_calls: int | None = None,
 ) -> dict[str, Any]:
     config = load_config(home / "config" / "projects.yaml")
     ids = project_ids or list((config.get("projects") or {}).keys())
@@ -977,7 +1022,18 @@ def analyze_all(
         intelligence: Mapping[str, Any] | None = project_intelligence(home, days=180, target=date.today())
     except Exception:
         intelligence = None
+    if max_model_calls is None:
+        try:
+            max_model_calls = max(0, int(os.environ.get("RD_ALGORITHM_MAX_MODEL_CALLS", "4")))
+        except ValueError:
+            max_model_calls = 4
+    if force:
+        max_model_calls = None
+    # Older snapshots go first so a persistent queue progresses instead of
+    # favoring the first configured project every night.
+    ids.sort(key=lambda pid: str((load_snapshot(home, pid) or {}).get("generated_at") or ""))
     results, failures = [], []
+    used_model_calls = 0
     for index, project_id in enumerate(ids, 1):
         if progress:
             progress(f"[{index}/{len(ids)}] {project_id}: 扫描证据并检查缓存…")
@@ -985,22 +1041,32 @@ def analyze_all(
             snapshot = analyze_project(
                 home, project_id, model=model, fallback_model=fallback_model,
                 force=force, _intelligence=intelligence,
+                max_model_attempts=(None if max_model_calls is None else max_model_calls - used_model_calls),
             )
+            used_model_calls += int(snapshot.get("model_attempts", 0) or 0)
             results.append({"project_id": project_id, "status": snapshot.get("status"),
                             "snapshot_id": snapshot.get("snapshot_id"), "cache_hit": bool(snapshot.get("cache_hit")),
-                            "model": (snapshot.get("model_run") or {}).get("model")})
+                            "model": (snapshot.get("model_run") or {}).get("model"),
+                            "action": snapshot.get("refresh_action"),
+                            "model_attempts": int(snapshot.get("model_attempts", 0) or 0)})
             if progress:
-                suffix = "缓存命中" if snapshot.get("cache_hit") else "快照已更新"
+                suffix = {
+                    "cache_hit": "缓存命中", "deferred": "预算不足，延后",
+                    "insufficient": "证据不足", "failed": "分析失败，保留旧快照",
+                }.get(str(snapshot.get("refresh_action")), "快照已更新")
                 progress(f"[{index}/{len(ids)}] {project_id}: {snapshot.get('status')} · {suffix}")
         except Exception as exc:
             failures.append({"project_id": project_id, "error": str(exc)})
             if progress:
                 progress(f"[{index}/{len(ids)}] {project_id}: 失败 · {exc}")
     return {"generated_at": _utc_now(), "projects": results, "failures": failures,
+            "model_budget": {"limit": max_model_calls, "used": used_model_calls,
+                             "deferred": sum(item.get("action") == "deferred" for item in results)},
             "counts": {"total": len(ids), "ready": sum(item["status"] == "ready" for item in results),
                        "insufficient": sum(item["status"] == "insufficient_evidence" for item in results),
                        "analysis_failed": sum(item["status"] == "analysis_failed" for item in results),
-                       "cached": sum(item["cache_hit"] for item in results)}}
+                       "cached": sum(item.get("action") == "cache_hit" for item in results),
+                       "deferred": sum(item.get("action") == "deferred" for item in results)}}
 
 
 def architecture_index(home: Path) -> dict[str, Any]:

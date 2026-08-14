@@ -38,7 +38,7 @@ flowchart LR
 - **日报是主记录**：写清楚做了什么、为什么、结果、结论、关键文件和下一步。
 - **采集器是证据层**：记录会话边界、命令结果、Git 状态和 Token 计数，不直接生成成果。
 - **LLM 是可选分析器**：只在需要语义提炼时生成候选内容；结果必须引用给定证据并通过程序校验。
-- **Dashboard 是只读视图**：页面不负责维护任务卡，也不会在切换页面时临时调用模型。
+- **Dashboard 基本只读**：页面不负责维护任务卡，也不会在切换页面时临时调用模型。唯一写操作是给项目故事做本地语义纠错；论文检索、中文速读和其他语义提炼只在后台刷新。
 
 ## 主要功能
 
@@ -71,13 +71,15 @@ flowchart LR
 
 ### 3. 项目发展：轨迹、阶段、指标与投入节奏
 
-先给出一个项目当前在做什么、最近结果、阻塞与下一步，再用地铁图、研发星空、阶段分布和指标轨迹回看发展过程。
+先给出一个项目当前在做什么、最近结果、阻塞与下一步，再用地铁图、研发星空、阶段分布和指标轨迹回看发展过程。首页先读取轻量摘要，选中项目后才加载该项目细节；全局知识图和历史快照按展开操作加载。
 
 ![项目发展](docs/images/03-development.png)
 
 ### 4. 项目情报：Project Pulse 与 Since Last Visit
 
 用 Project Pulse 压缩项目近况；用 Since Last Visit、Open Unknowns、投入与有效进展、Breakthrough Timeline 和 Project Storyline 回答“哪里变了、还不知道什么”。
+
+Project Storyline 下方可以标记“准确 / 没意义 / 内容错误 / 项目错误 / 有遗漏”。反馈只写入本地追加式账本，不会进入公开仓库，也不会被当作研究事实；下一次后台审计只重算反馈所引用的日报日期。新结果若缺少项目摘要、重复率过高或大量引用校验失败，会被质量闸门拒绝，页面继续显示明确标记的“上次可信版本”。
 
 ![项目情报](docs/images/04-intelligence.png)
 
@@ -97,6 +99,8 @@ flowchart LR
 
 分别展示每天 Token、Codex / Claude Code 来源、项目归属，以及工作记录、实验和明确结论的变化。Token 只适合观察量级，不等于费用、工时或工作质量。
 
+Codex / Claude Code 生命周期 Hook 另提供成功操作、失败操作、可观测执行耗时和涉及会话数的聚合视图。原始工具流水不会直接出现在页面，也不会被包装成成果。
+
 ![数据分析](docs/images/07-analytics.png)
 
 ### 8. 结论与知识：可复用的研究认知
@@ -107,7 +111,7 @@ flowchart LR
 
 ### 9. 研究雷达：项目相关论文与中文速读
 
-按相关度、研究质量和实际价值筛选论文，默认只展示 A/B 级候选。中文摘要、关键点和“为什么值得读”帮助快速判断，英文原文和元数据可按需展开。
+按相关度、研究质量和实际价值筛选论文，默认只展示 A/B 级候选。中文摘要、关键点和“为什么值得读”帮助快速判断，英文原文和元数据可按需展开。页面只读取最近一次完整快照；检索或模型不可用时保留旧快照，不会让浏览请求等待或消耗 Token。
 
 ![研究雷达](docs/images/09-radar.png)
 
@@ -145,9 +149,21 @@ cd rd-cockpit
 ./scripts/start.sh
 ```
 
-打开 <http://127.0.0.1:4016>。API 默认只监听 <http://127.0.0.1:8787>。
+打开 <http://127.0.0.1:4016>。开发脚本仍会在 `8787` 启动独立 API；长期运行模式会把同一套只读 API 合并到 `4016/api`，不再常驻一份重复后端。
 
 首次初始化会生成 `config/projects.local.yaml`。它的权限为 `0600`，已被 Git 忽略；公开仓库中的 `config/projects.yaml` 只是匿名空模板。
+
+如果需要长期运行，可以安装用户级服务和定时刷新：
+
+```bash
+./scripts/install-user-services.sh
+```
+
+安装脚本会先构建前端，再用一个 Python 进程同时提供静态页面和 `/api`，不会长期运行 Vite 开发服务器、文件监听器或重复 API。它会持续运行资源采样和增量 Token 同步，在每天 01:15（日报任务之后）刷新项目归类、实验提炼、算法架构和论文雷达，并预计算项目发展、项目情报和数据分析页面；每天 03:30 创建经过 SQLite 完整性校验的本地备份、增量归档低层历史事件、把 30 天前的高频 Agent 事件迁入可查询冷库，把 30 天前的 GPU 原始采样压缩为小时/日聚合，并清理过期或重复的派生视图缓存。首页的“后台资料更新”会显示每一步是正常、运行中还是失败。默认页面仍只监听 `127.0.0.1`；如需在可信局域网访问，可在安装时显式设置 `RD_WEB_HOST`，但请先阅读隐私说明。
+
+当 `RD_WEB_HOST` 不是回环地址时，安装脚本会在私有的 `~/.config/rd-cockpit/env` 中生成 `RD_API_TOKEN`。浏览器首次打开会要求输入一次；生产 API 默认只开放页面使用的脱敏 `/api/simple/*` 接口，原始事件、Timeline、API 文档和绝对路径不会暴露。确需兼容旧接口时可显式设置 `RD_ENABLE_LEGACY_API=1`，但不建议在局域网模式使用。
+
+备份、冷库、物化视图与归档都位于被 Git 忽略的 `.rd-cockpit/` 下。旧工具调用和旧 Token 事件先写入可校验的月归档及独立冷库，确认复制完整后才从热库移除；CLI 查询、证据和历史撤销会自动合并冷热两库。30 天前的 GPU 原始采样则在备份、归档并生成小时/日聚合后清理。需要额外保留独立的 `8787` API 时，可在安装命令前设置 `RD_ENABLE_STANDALONE_API=1`。
 
 ## 接入现有 Daily Report
 
@@ -174,6 +190,8 @@ export RD_DAILY_REPORT_DIR="$HOME/research-reports"
 
 历史结构化提炼会写入日报旁边被忽略的 sidecar 缓存，**不会改写原始 Markdown**。源文件变化后缓存自动失效。
 
+用户可见项目只来自 `projects.local.yaml` 的登记表。旧日报里的历史别名可以通过 `legacy_project_ids` 或顶层 `project_aliases` 映射；无法确认的标签统一进入“未登记历史记录”，不会自动长成一个新项目。
+
 ## Daily Report Skill
 
 仓库内置了可审查、可修改的 [`daily-report` Skill](skills/daily-report/SKILL.md)。它从受限的本地 Session 摘要、已登记仓库、测试与 Git 证据以及昨日计划生成候选日报，然后通过校验器拒绝无证据的完成状态、数字和引用。
@@ -194,7 +212,7 @@ export RD_DAILY_REPORT_DIR="$HOME/research-reports"
 .venv/bin/rd install-hooks
 ```
 
-Hook 记录 Session 开始/结束和结构化命令结果，识别测试、benchmark、训练与评测。它不会复制完整 prompt、完整模型回复或终端录像。SQLite 暂时繁忙时，Hook 会快速写入脱敏队列，避免阻塞 Agent 退出。详情见 [hooks/README.md](hooks/README.md)。
+Hook 记录 Session 开始/结束和结构化命令结果，识别测试、benchmark、训练与评测。普通成功工具调用只累加到按天、项目和 Session 聚合的活动统计，不再制造一长串低价值事件；失败、实验和验证仍保留可追溯记录。它不会复制完整 prompt、完整模型回复或终端录像。SQLite 暂时繁忙时，Hook 会快速写入脱敏队列，避免阻塞 Agent 退出。详情见 [hooks/README.md](hooks/README.md)。
 
 常用命令：
 
@@ -208,6 +226,8 @@ Hook 记录 Session 开始/结束和结构化命令结果，识别测试、bench
 .venv/bin/rd project discover --days 30
 .venv/bin/rd algorithm-analyze speech_research
 .venv/bin/rd experiment-backfill --days 90 --project speech_research
+.venv/bin/rd radar-refresh
+.venv/bin/rd doctor
 ```
 
 ## LLM 使用方式
@@ -217,8 +237,30 @@ Hook 记录 Session 开始/结束和结构化命令结果，识别测试、bench
 - 模型只读取为当前任务构造的有界证据包；
 - 输出使用结构化 JSON，并要求引用允许的证据 ID；
 - 程序再次校验项目归属、引用、数字和状态；
-- 结果按源内容哈希缓存，证据不变时不会反复调用；
+- 项目情报还会检查可读摘要覆盖率、被移除候选数量和重复率；不合格批次不会覆盖上一次可信结果；
+- 页面纠错以本地反馈事件保存，只使其引用日期的语义缓存失效；用户意见用于审计改进，不能代替日报证据；
+- 语义结果同时绑定源内容哈希、输出 Schema、Prompt 版本、模型策略和项目目录；任何一项变化都会使旧缓存失效；
+- `rd semantic-eval` 可离线运行覆盖多项目归属、计划冒充结果、数字/版本篡改和无活动判断的 golden 回归；
+- 算法架构只比较实际送入分析器的代码、配置与日报片段；普通 commit、分支或无关段落变化不会使缓存失效；
+- 夜间架构刷新默认最多调用 4 次模型，剩余项目自动延后到下一轮；
+- 首页显示最近 24 小时实际模型调用、缓存命中、延后数量和 Token；`/api/simple/model-runs` 提供不含 prompt/输出的调用账单；
 - 模型不可用时，确定性视图仍可使用，语义视图显示保守回退或缓存状态。
+
+Agent Token 同步使用一张“当前会话”状态表原地更新。只有会话静默、跨日或切换项目时才向事实账本追加一条结算记录，避免每五分钟保存一份累计计数器快照。
+
+## 性能与健康检查
+
+日报仍是唯一事实来源，但系统会在私有的 `.rd-cockpit/report-facts.json` 中保存按内容指纹增量更新的解析快照。日报、审计 sidecar 或用量补充没有变化时，多张页面直接复用同一份事实；项目公共配置变化时则安全地全量重建。项目发展使用摘要、单项目、全局视图和分页历史接口，避免首屏下载完整关系图与所有历史。
+
+运行只读体检：
+
+```bash
+.venv/bin/rd doctor
+```
+
+它会检查配置、SQLite 完整性和 schema、日报事实快照、物化视图、语义缓存、Hook 队列、前端构建、用户服务，并把最新备份恢复到临时目录做一次真实演练。不会修改原数据库或停止资源。
+
+CI 同时执行后端测试、前端测试与构建、语义 golden 回归、固定规模投影性能门禁以及包含 Git 历史的隐私扫描。
 
 可选配置见 [.env.example](.env.example)：
 
@@ -227,6 +269,8 @@ export RD_LLM_BASE_URL="http://127.0.0.1:4000/v1"
 export RD_LLM_API_KEY="..."
 export RD_LLM_MODEL="your-model"
 export RD_LLM_FALLBACK_MODEL="your-fallback-model"
+export RD_VIEW_CACHE_RETENTION_DAYS=14
+export RD_VIEW_CACHE_MAX_MB=100
 ```
 
 不要把密钥写进仓库。
@@ -252,7 +296,7 @@ export RD_LLM_FALLBACK_MODEL="your-fallback-model"
 ./scripts/privacy-check.sh --history
 ```
 
-启用外部模型或把服务暴露到局域网前，请先阅读 [PRIVACY.md](PRIVACY.md)。API 没有内置身份认证；除非前面增加了带认证的反向代理，否则应保持 localhost 监听。
+启用外部模型或把服务暴露到局域网前，请先阅读 [PRIVACY.md](PRIVACY.md)。回环地址保持零配置；绑定局域网地址时，安装器会启用 Bearer Token、关闭 API 文档与原始事件接口，并对页面 JSON 再做路径、机器、Session 和内网地址脱敏。HTTP Token 不能替代不可信网络上的 TLS；跨网段或公网访问仍应放在 HTTPS 反向代理后。
 
 ## 开发与验证
 

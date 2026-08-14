@@ -259,6 +259,49 @@ def _sidecar(root: Path, day: str) -> Path:
     return root / "data" / "experiments" / f"{day}.json"
 
 
+def _cached_day(
+    root: Path, existing: dict[str, Any], record: dict[str, Any],
+    selected_projects: list[str], candidate_projects: list[str],
+    policy: str, models: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if (
+        existing.get("source_sha256") != record["source_sha256"]
+        or existing.get("selected_projects") != selected_projects
+    ):
+        return None
+    if (
+        existing.get("schema_version") == SCHEMA_VERSION
+        and existing.get("prompt_version") == PROMPT_VERSION
+        and existing.get("policy_fingerprint") == policy
+    ):
+        return existing
+    metadata = existing.get("model_run") if isinstance(existing.get("model_run"), dict) else {}
+    deterministic = metadata.get("provider") == "deterministic" and not candidate_projects
+    if not deterministic and str(metadata.get("model") or "") not in models:
+        return None
+    try:
+        upgraded = _validate_day(
+            existing, record, set(candidate_projects),
+            {**metadata, "policy_fingerprint": policy, "prompt_version": PROMPT_VERSION},
+        )
+    except ValueError:
+        return None
+    removed = max(
+        0, len(existing.get("experiments") or []) - len(upgraded.get("experiments") or []),
+    )
+    upgraded.update({
+        "policy_fingerprint": policy,
+        "selected_projects": selected_projects,
+        "candidate_projects": candidate_projects,
+        "cache_migration": {
+            "from_schema": existing.get("schema_version"), "model_call": False,
+            "removed_unsupported_records": removed,
+        },
+    })
+    _write_json(_sidecar(root, record["date"]), upgraded)
+    return upgraded
+
+
 def backfill(
     *, directory: Path | None = None, days: int = 90, batch_days: int = 7,
     projects: list[str] | None = None, model: str = DEFAULT_MODEL,
@@ -268,6 +311,15 @@ def backfill(
     root = directory or report_directory()
     target = target or date.today()
     selected_projects = list(dict.fromkeys(projects or DEFAULT_PROJECTS))
+    from .semantic_policy import policy_fingerprint
+    policy = policy_fingerprint(
+        "experiment-intelligence-backfill",
+        schema_version=SCHEMA_VERSION,
+        prompt_version=PROMPT_VERSION,
+        models=(model, fallback_model),
+        extra={"projects": selected_projects},
+    )
+    policy_models = tuple(value for value in (model, fallback_model) if value)
     valid_projects = set(project_display_names())
     unknown = sorted(set(selected_projects) - valid_projects)
     if unknown:
@@ -289,25 +341,23 @@ def backfill(
             existing = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
         except (OSError, json.JSONDecodeError):
             pass
-        cache_ok = (
-            not force
-            and existing.get("schema_version") == SCHEMA_VERSION
-            and existing.get("prompt_version") == PROMPT_VERSION
-            and existing.get("source_sha256") == record["source_sha256"]
-            and existing.get("selected_projects") == selected_projects
+        accepted_cache = None if force else _cached_day(
+            root, existing, record, selected_projects, project_candidates,
+            policy, policy_models,
+        )
+        cache_ok = accepted_cache is not None and (
             # A fallback result is usable immediately, but a later healthy
-            # primary model should automatically replace it.  Deterministic
+            # primary model should automatically replace it. Deterministic
             # empty days never need a model retry.
-            and (
-                (existing.get("model_run") or {}).get("model") == model
-                or (existing.get("model_run") or {}).get("provider") == "deterministic"
-            )
+            (accepted_cache.get("model_run") or {}).get("model") == model
+            or (accepted_cache.get("model_run") or {}).get("provider") == "deterministic"
         )
         if cache_ok:
             cached.append(day)
         elif not project_candidates:
             value = {
                 "schema_version": SCHEMA_VERSION, "prompt_version": PROMPT_VERSION,
+                "policy_fingerprint": policy,
                 "date": day, "source_path": str(path), "source_sha256": record["source_sha256"],
                 "selected_projects": selected_projects, "candidate_projects": [], "experiments": [],
                 "validation_errors": [], "model_run": {"provider": "deterministic", "model": None},
@@ -328,13 +378,16 @@ def backfill(
         for selected_model in list(dict.fromkeys(value for value in (model, fallback_model) if value)):
             calls += 1
             try:
-                raw, metadata = _request_any_model(selected_model, instruction)
+                raw, metadata = _request_any_model(selected_model, instruction, stage="experiments")
+                metadata = {**(metadata or {}), "policy_fingerprint": policy,
+                            "prompt_version": PROMPT_VERSION}
                 by_date = {str(item.get("date")): item for item in raw.get("days", []) if isinstance(item, dict)}
                 values = [
                     _validate_day(by_date.get(item["date"], {}), item, set(candidates[item["date"]]), metadata)
                     for item in batch
                 ]
                 for value in values:
+                    value["policy_fingerprint"] = policy
                     value["selected_projects"] = selected_projects
                     value["candidate_projects"] = candidates[value["date"]]
                     _write_json(_sidecar(root, value["date"]), value)
@@ -489,6 +542,8 @@ def experiment_intelligence(
         source = root / f"{day}.md"
         if (
             value.get("schema_version") != SCHEMA_VERSION
+            or value.get("prompt_version") != PROMPT_VERSION
+            or not value.get("policy_fingerprint")
             or value.get("source_sha256") != hashlib.sha256(source.read_bytes()).hexdigest()
         ):
             continue

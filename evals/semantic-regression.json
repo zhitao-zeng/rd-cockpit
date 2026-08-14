@@ -1,0 +1,315 @@
+{
+  "cases": [
+    {
+      "name": "accept_dialect_lid_accuracy",
+      "date": "2026-08-01",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-01\n\n## 核心进展\n- 完成 16 类方言 LID 训练，准确率达到 97.6%。",
+      "project_ids": ["asr_dialect"],
+      "task": {"title": "训练 16 类方言 LID", "did": ["完成 16 类方言 LID 训练。"], "results": ["准确率达到 97.6%。"], "evidence_lines": [[4, 4]]},
+      "assert": {"task_count": 1, "project_ids": ["asr_dialect"], "confidence": ["reported"]}
+    },
+    {
+      "name": "reject_future_jetson_plan_as_result",
+      "date": "2026-08-02",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-02\n\n## 明日计划\n- 完成 Jetson benchmark，目标延迟 47ms。",
+      "project_ids": ["obstacle"],
+      "task": {"title": "完成 Jetson benchmark", "did": ["完成 Jetson benchmark。"], "results": ["延迟达到 47ms。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_hallucinated_ocr_latency",
+      "date": "2026-08-03",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-03\n\n## 核心进展\n- OCR 本地 benchmark 延迟为 52ms。",
+      "project_ids": ["ocr"],
+      "task": {"title": "OCR benchmark", "did": ["完成本地 benchmark。"], "results": ["延迟为 47ms。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_explicit_no_activity",
+      "date": "2026-08-04",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-04\n\n今日无记录，无实质开发活动。",
+      "candidate": {"no_activity": true, "day_summary": "当天无研发记录。", "groups": []},
+      "assert": {"task_count": 0, "no_activity": true, "project_ids": []}
+    },
+    {
+      "name": "reject_unsubstantiated_no_activity",
+      "date": "2026-08-05",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-05\n\n今天主要整理思路。",
+      "candidate": {"no_activity": true, "groups": []}
+    },
+    {
+      "name": "accept_exact_ocr_latency",
+      "date": "2026-08-06",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-06\n\n## 核心进展\n- OCR 推理延迟稳定在 52ms。",
+      "project_ids": ["ocr"],
+      "task": {"title": "OCR 推理评测", "results": ["推理延迟稳定在 52ms。"], "evidence_lines": [[4, 4]]},
+      "assert": {"task_count": 1, "project_ids": ["ocr"]}
+    },
+    {
+      "name": "reject_changed_ocr_latency",
+      "date": "2026-08-07",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-07\n\n## 核心进展\n- OCR 推理延迟稳定在 52ms。",
+      "project_ids": ["ocr"],
+      "task": {"title": "OCR 推理评测", "results": ["推理延迟稳定在 51ms。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_negative_accuracy_delta",
+      "date": "2026-08-08",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-08\n\n## 核心进展\n- native backend 的 accuracy drop 为 0.2%。",
+      "project_ids": ["obstacle"],
+      "task": {"title": "native backend 精度核对", "results": ["accuracy drop 为 0.2%。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_exact_test_count",
+      "date": "2026-08-09",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-09\n\n## 核心进展\n- 本地回归 18 tests passed。",
+      "project_ids": ["obstacle"],
+      "task": {"title": "本地回归", "results": ["18 tests passed。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_inflated_test_count",
+      "date": "2026-08-10",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-10\n\n## 核心进展\n- 本地回归 18 tests passed。",
+      "project_ids": ["obstacle"],
+      "task": {"title": "本地回归", "results": ["19 tests passed。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_model_version",
+      "date": "2026-08-11",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-11\n\n## 核心进展\n- 将识别模型升级到 6.1.0 并完成回归。",
+      "project_ids": ["ocr"],
+      "task": {"title": "升级识别模型 6.1.0", "did": ["升级到 6.1.0。"], "results": ["完成回归。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_changed_model_version",
+      "date": "2026-08-12",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-12\n\n## 核心进展\n- 将识别模型升级到 6.1.0 并完成回归。",
+      "project_ids": ["ocr"],
+      "task": {"title": "升级识别模型 6.2.0", "did": ["升级到 6.2.0。"], "results": ["完成回归。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_latency_before_after",
+      "date": "2026-08-13",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-13\n\n## 核心进展\n- TensorRT 延迟从 82ms 降到 47ms。",
+      "project_ids": ["obstacle"],
+      "task": {"title": "TensorRT 延迟优化", "results": ["延迟从 82ms 降到 47ms。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_changed_latency_baseline",
+      "date": "2026-08-14",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-14\n\n## 核心进展\n- TensorRT 延迟从 82ms 降到 47ms。",
+      "project_ids": ["obstacle"],
+      "task": {"title": "TensorRT 延迟优化", "results": ["延迟从 80ms 降到 47ms。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_non_numeric_implementation",
+      "date": "2026-08-15",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-15\n\n## 核心进展\n- 完成流式解码接口并接入现有服务。",
+      "project_ids": ["asr"],
+      "task": {"title": "接入流式解码", "did": ["完成流式解码接口。"], "results": ["已接入现有服务。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_legacy_inferred_task",
+      "date": "2026-08-16",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-16\n\n## 核心进展\n- 梳理旧实验路线，暂未形成结论。",
+      "project_ids": ["research_tools"],
+      "task": {"title": "整理历史方案", "did": ["回顾既有研究尝试。"]},
+      "assert": {"task_count": 1, "confidence": ["inferred"], "quality_contains": ["没有可用原文行号证据"]}
+    },
+    {
+      "name": "accept_reported_task_with_anchor",
+      "date": "2026-08-17",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-17\n\n## 核心进展\n- 修复端到端回归脚本。",
+      "project_ids": ["resume_copilot"],
+      "task": {"title": "修复端到端回归脚本", "did": ["修复端到端回归脚本。"], "evidence_lines": [[4, 4]]},
+      "assert": {"confidence": ["reported"]}
+    },
+    {
+      "name": "accept_multiline_evidence",
+      "date": "2026-08-18",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-18\n\n## 核心进展\n- 完成多实例评测。\n- Mean 1-CER = 0.7648。",
+      "project_ids": ["ocr"],
+      "task": {"title": "多实例评测", "did": ["完成多实例评测。"], "results": ["Mean 1-CER = 0.7648。"], "evidence_lines": [[4, 5]]}
+    },
+    {
+      "name": "reject_multiline_wrong_metric",
+      "date": "2026-08-19",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-19\n\n## 核心进展\n- 完成多实例评测。\n- Mean 1-CER = 0.7648。",
+      "project_ids": ["ocr"],
+      "task": {"title": "多实例评测", "did": ["完成多实例评测。"], "results": ["Mean 1-CER = 0.7748。"], "evidence_lines": [[4, 5]]}
+    },
+    {
+      "name": "accept_task_with_plan_closure_metadata",
+      "date": "2026-08-20",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-20\n\n## 核心进展\n- Docker 构建已通过。\n\n## 昨日计划闭环\n- Docker 构建：completed",
+      "project_ids": ["obstacle"],
+      "plan_closure": ["Docker 构建：completed"],
+      "task": {"title": "Docker 构建", "results": ["Docker 构建已通过。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_task_with_decision_metadata",
+      "date": "2026-08-21",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-21\n\n## 核心进展\n- 对统一阈值完成对照评测。",
+      "project_ids": ["ocr"],
+      "decisions": ["阈值策略暂按数据分布条件采用"],
+      "task": {"title": "阈值对照评测", "did": ["完成对照评测。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_unassigned_legacy_record",
+      "date": "2026-08-22",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-22\n\n## 核心进展\n- 整理一个尚未登记的原型。",
+      "project_ids": ["unassigned"],
+      "task": {"title": "整理未登记原型", "did": ["整理一个尚未登记的原型。"], "evidence_lines": [[4, 4]]},
+      "assert": {"project_ids": ["unassigned"]}
+    },
+    {
+      "name": "accept_alignment_project_inference",
+      "date": "2026-08-23",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-23\n\n## 核心进展\n- 强制对齐流程已跑通。",
+      "project_ids": [],
+      "task": {"title": "强制对齐流程", "results": ["强制对齐流程已跑通。"], "evidence_lines": [[4, 4]]},
+      "assert": {"project_ids": ["asr_alignment"]}
+    },
+    {
+      "name": "accept_dialect_project_inference",
+      "date": "2026-08-24",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-24\n\n## 核心进展\n- 方言识别开发集完成解码。",
+      "project_ids": [],
+      "task": {"title": "方言识别开发集解码", "results": ["开发集完成解码。"], "evidence_lines": [[4, 4]]},
+      "assert": {"project_ids": ["asr_dialect"]}
+    },
+    {
+      "name": "accept_generic_asr_fallback",
+      "date": "2026-08-25",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-25\n\n## 核心进展\n- ASR 模块完成接口核对。",
+      "project_ids": [],
+      "task": {"title": "ASR 接口核对", "results": ["ASR 模块完成接口核对。"], "evidence_lines": [[4, 4]]},
+      "assert": {"project_ids": ["asr_other"]}
+    },
+    {
+      "name": "accept_two_projects_kept_separate",
+      "date": "2026-08-26",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-26\n\n## 核心进展\n- OCR 完成本地评测。\n- 方言识别完成开发集解码。",
+      "candidate": {"groups": [{"title": "两条主线", "project_ids": ["ocr", "asr_dialect"], "tasks": [{"title": "OCR 本地评测", "project_ids": ["ocr"], "did": [], "why": [], "results": ["OCR 完成本地评测。"], "files": [], "conclusions": [], "evidence_lines": [[4, 4]]}, {"title": "方言识别开发集解码", "project_ids": ["asr_dialect"], "did": [], "why": [], "results": ["方言识别完成开发集解码。"], "files": [], "conclusions": [], "evidence_lines": [[5, 5]]}]}]},
+      "assert": {"task_count": 2, "project_ids": ["ocr", "asr_dialect"]}
+    },
+    {
+      "name": "accept_valid_task_and_remove_invalid_sibling",
+      "date": "2026-08-27",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-27\n\n## 核心进展\n- 本地延迟为 60ms。\n\n## 明日计划\n- 远端延迟目标 40ms。",
+      "candidate": {"groups": [{"title": "Obstacle", "project_ids": ["obstacle"], "tasks": [{"title": "本地评测", "project_ids": ["obstacle"], "did": [], "why": [], "results": ["本地延迟为 60ms。"], "files": [], "conclusions": [], "evidence_lines": [[4, 4]]}, {"title": "远端评测", "project_ids": ["obstacle"], "did": ["完成远端评测。"], "why": [], "results": ["远端延迟为 40ms。"], "files": [], "conclusions": [], "evidence_lines": [[7, 7]]}]}]},
+      "assert": {"task_count": 1, "quality_contains": ["已移除不受原文支持的任务"]}
+    },
+    {
+      "name": "reject_only_future_task",
+      "date": "2026-08-28",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-28\n\n## 下一步\n- 运行完整回归，预计 24 tests passed。",
+      "project_ids": ["resume_copilot"],
+      "task": {"title": "完整回归", "did": ["运行完整回归。"], "results": ["24 tests passed。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_zero_failures",
+      "date": "2026-08-29",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-29\n\n## 核心进展\n- 回归结果为 0 failed、24 passed。",
+      "project_ids": ["resume_copilot"],
+      "task": {"title": "完整回归", "results": ["0 failed、24 passed。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_hallucinated_gpu_cost",
+      "date": "2026-08-30",
+      "expected": "reject",
+      "markdown": "# 日报 2026-08-30\n\n## 核心进展\n- 完成一轮模型训练。",
+      "project_ids": ["asr_dialect"],
+      "task": {"title": "模型训练", "results": ["完成训练，共消耗 31 GPU-hours。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_explicit_rest_day_phrase",
+      "date": "2026-08-31",
+      "expected": "accept",
+      "markdown": "# 日报 2026-08-31\n\n全天无活动，无工作任务。",
+      "candidate": {"no_activity": true, "groups": []},
+      "assert": {"no_activity": true}
+    },
+    {
+      "name": "reject_casual_rest_phrase",
+      "date": "2026-09-01",
+      "expected": "reject",
+      "markdown": "# 日报 2026-09-01\n\n下午休息，上午看了一些代码。",
+      "candidate": {"no_activity": true, "groups": []}
+    },
+    {
+      "name": "accept_chinese_percentage",
+      "date": "2026-09-02",
+      "expected": "accept",
+      "markdown": "# 日报 2026-09-02\n\n## 核心进展\n- 验证集召回率达到 88.3%。",
+      "project_ids": ["ocr"],
+      "task": {"title": "验证集评测", "results": ["召回率达到 88.3%。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_unsupported_percentage",
+      "date": "2026-09-03",
+      "expected": "reject",
+      "markdown": "# 日报 2026-09-03\n\n## 核心进展\n- 验证集召回率达到 88.3%。",
+      "project_ids": ["ocr"],
+      "task": {"title": "验证集评测", "results": ["召回率达到 89.3%。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_open_blocker_as_metadata",
+      "date": "2026-09-04",
+      "expected": "accept",
+      "markdown": "# 日报 2026-09-04\n\n## 核心进展\n- 本地实现已经完成。\n\n## 阻塞 / 待解决\n- 远端设备暂不可用。",
+      "project_ids": ["obstacle"],
+      "blockers": ["远端设备暂不可用。"],
+      "task": {"title": "本地实现", "results": ["本地实现已经完成。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "accept_scoped_conclusion",
+      "date": "2026-09-05",
+      "expected": "accept",
+      "markdown": "# 日报 2026-09-05\n\n## 核心进展\n- 对照结果表明该阈值只适用于小字验证集。",
+      "project_ids": ["ocr"],
+      "task": {"title": "阈值适用范围", "results": ["完成对照。"], "conclusions": ["该阈值只适用于小字验证集。"], "evidence_lines": [[4, 4]]}
+    },
+    {
+      "name": "reject_missing_groups_schema",
+      "date": "2026-09-06",
+      "expected": "reject",
+      "markdown": "# 日报 2026-09-06\n\n## 核心进展\n- 完成一次评测。",
+      "candidate": {"day_summary": "完成一次评测。"}
+    },
+    {
+      "name": "reject_empty_candidate_on_nonempty_report",
+      "date": "2026-09-07",
+      "expected": "reject",
+      "markdown": "# 日报 2026-09-07\n\n## 核心进展\n- 完成一次真实评测。",
+      "candidate": {"groups": [], "no_activity": false}
+    }
+  ]
+}

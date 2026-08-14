@@ -8,10 +8,13 @@ const API_TARGET = process.env.VITE_API_PROXY_TARGET ?? "http://127.0.0.1:8787";
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   build: {
+    // ECharts is route-lazy and about 170 kB gzip.  Keep it as one coherent
+    // chunk: forcibly splitting zrender creates a circular chunk and more
+    // requests without reducing bytes transferred.
+    chunkSizeWarningLimit: 520,
     rollupOptions: {
       output: {
         manualChunks: {
-          echarts: ["echarts"],
           vendor: ["react", "react-dom", "react-router-dom", "@tanstack/react-query"],
         },
       },

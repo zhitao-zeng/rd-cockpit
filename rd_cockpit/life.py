@@ -220,9 +220,9 @@ def _memory_card(target: date) -> dict[str, Any]:
     }
 
 
-def _random_knowledge(target: date) -> dict[str, Any]:
+def _random_knowledge(target: date, home: Path | None = None) -> dict[str, Any]:
     candidates: list[dict[str, str]] = []
-    for report in iter_reports():
+    for report in iter_reports(cache_home=home):
         for text in report.get("knowledge", []):
             candidates.append({"text": str(text), "date": str(report.get("date") or "")})
         for group in report.get("groups", []):
@@ -430,7 +430,7 @@ def life_dashboard(ledger: Ledger, home: Path, target: date | None = None, now: 
         "token_books": _token_books(latest_report, personal),
         "research_weather": _research_weather(latest_report),
         "last_year_today": _memory_card(target),
-        "random_knowledge": _random_knowledge(target),
+        "random_knowledge": _random_knowledge(target, home),
         "gpu_pet": _gpu_pet(ledger, now),
         "milestones": _milestones(target, personal, employment, projects, streak),
         "notes": [

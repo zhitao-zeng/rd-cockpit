@@ -1,0 +1,10 @@
+[Unit]
+Description=R&D Cockpit verified backup and data retention
+After=rd-cockpit-refresh.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ROOT@
+EnvironmentFile=-%h/.config/rd-cockpit/env
+ExecStart=/usr/bin/flock --wait 3600 @ROOT@/.rd-cockpit/maintenance.lock @PYTHON@ -m rd_cockpit --home @ROOT@ maintain --backup-retention-days 14 --resource-retention-days 30 --cold-retention-days 30
+TimeoutStartSec=2h

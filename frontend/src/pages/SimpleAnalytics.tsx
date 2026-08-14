@@ -74,13 +74,25 @@ function AnalyticsContent({ data }: { data: Awaited<ReturnType<typeof getSimpleA
         <StatCard label="明确结论" value={data.totals.conclusions} hint="已写入知识汇总的结论" tone="good" />
       </div>
 
+      {(data.agent_activity.totals.completed > 0 || data.agent_activity.totals.failed > 0) && (
+        <Card title="Agent 实际执行概况" subtitle="来自 Codex / Claude Code 生命周期 Hook 的汇总，不展示难懂的原始事件">
+          <div className="grid gap-3 sm:grid-cols-4">
+            <StatCard label="涉及会话" value={data.agent_activity.totals.sessions} hint={`最近 ${data.days} 天`} />
+            <StatCard label="成功操作" value={data.agent_activity.totals.completed} hint="工具与阶段完成的聚合计数" tone="good" />
+            <StatCard label="失败操作" value={data.agent_activity.totals.failed} hint="用于发现执行质量，不等于实验失败" tone={data.agent_activity.totals.failed ? "bad" : undefined} />
+            <StatCard label="可观测执行耗时" value={`${data.agent_activity.totals.duration_minutes.toFixed(1)} 分钟`} hint="仅统计 Hook 提供了耗时的操作" />
+          </div>
+          <p className="mt-3 text-[10px] leading-4 text-ink3">{data.agent_activity.explanation}</p>
+        </Card>
+      )}
+
       <div className="grid gap-4 xl:grid-cols-2">
         <Card title="每天用了多少 Token" subtitle="看投入变化；峰值不代表产出更好，需要结合下方研究结果一起看">
           <Chart
             height={270}
             option={{
               ...baseChartOption(),
-              tooltip: { ...tooltipBase, trigger: "axis", valueFormatter: (value) => fmtTokens(Number(value)) },
+              tooltip: { ...tooltipBase, trigger: "axis", valueFormatter: (value: unknown) => fmtTokens(Number(value)) },
               xAxis: { type: "category", data: tokenAxis, ...axisBase() },
               yAxis: { type: "value", ...axisBase(), axisLabel: { color: C.ink2, formatter: (value: number) => fmtTokens(value) } },
               series: [lineSeries("Token", tokenValues, C.primary, { areaStyle: { color: "rgba(34,211,238,0.10)" } })],
@@ -93,7 +105,7 @@ function AnalyticsContent({ data }: { data: Awaited<ReturnType<typeof getSimpleA
             height={270}
             option={{
               ...baseChartOption(),
-              tooltip: { ...tooltipBase, trigger: "axis", axisPointer: { type: "shadow" }, valueFormatter: (value) => fmtTokens(Number(value)) },
+              tooltip: { ...tooltipBase, trigger: "axis", axisPointer: { type: "shadow" }, valueFormatter: (value: unknown) => fmtTokens(Number(value)) },
               legend: { ...legendBase() },
               xAxis: { type: "category", data: tokenAxis, ...axisBase() },
               yAxis: { type: "value", ...axisBase(), axisLabel: { color: C.ink2, formatter: (value: number) => fmtTokens(value) } },
@@ -110,7 +122,7 @@ function AnalyticsContent({ data }: { data: Awaited<ReturnType<typeof getSimpleA
             height={300}
             option={{
               ...baseChartOption(),
-              tooltip: { ...tooltipBase, trigger: "axis", axisPointer: { type: "shadow" }, valueFormatter: (value) => fmtTokens(Number(value)) },
+              tooltip: { ...tooltipBase, trigger: "axis", axisPointer: { type: "shadow" }, valueFormatter: (value: unknown) => fmtTokens(Number(value)) },
               grid: { left: 8, right: 20, top: 12, bottom: 4, containLabel: true },
               xAxis: { type: "value", ...axisBase(), axisLabel: { color: C.ink2, formatter: (value: number) => fmtTokens(value) } },
               yAxis: { type: "category", data: derived.projects.map(([id]) => data.project_names[id] ?? id), ...axisBase() },

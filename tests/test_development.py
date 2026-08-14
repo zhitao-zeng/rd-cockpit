@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from rd_cockpit.development import _failure_state, _phase, _primary_project_ids, _work_types, development_dashboard
+from rd_cockpit.development import (
+    _failure_state, _phase, _primary_project_ids, _work_types,
+    development_dashboard, development_global_view, development_history_view,
+    development_project_view, development_summary_view, development_timeline_view,
+)
 
 
 def _report(day: str, title: str, result: str, closure: str, blocker: str = "") -> str:
@@ -65,6 +69,17 @@ def test_development_dashboard_builds_eight_readable_views(tmp_path: Path, monke
     assert not any("CER" in node.get("full_text", "") for node in conclusion_nodes)
     assert result["time_travel"][0]["projects"][0]["not_known_until"] == "2026-08-02"
 
+    summary = development_summary_view(result)
+    assert summary["counts"] == {"nodes": 2, "projects": 1, "metrics": 2, "plans": 2}
+    detail = development_project_view(result, "speech_research", timeline_limit=12)
+    assert len(detail["storyline"]) == 2
+    assert detail["latest_snapshot"]["date"] == "2026-08-02"
+    assert development_global_view(result)["plans"]["total"] == 2
+    timeline = development_timeline_view(result, project_id="speech_research", limit=1)
+    assert timeline["total"] == 2 and timeline["has_more"] is True
+    history = development_history_view(result, limit=1)
+    assert history["total"] == 2 and history["items"][0]["date"] == "2026-08-02"
+
 
 def test_development_dashboard_preserves_configured_dormant_status(tmp_path: Path, monkeypatch) -> None:
     report_dir = tmp_path / "daily-reports"
@@ -106,10 +121,18 @@ def test_failure_state_respects_negation_recovery_and_open_work() -> None:
     assert _failure_state("三首歌曲仍无法跑，等待 ASR 补齐") == "open"
 
 
-def test_leading_project_owns_dependency_blocker() -> None:
+def test_leading_project_owns_dependency_blocker(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "projects.yaml"
+    config.write_text(
+        "projects:\n  asr:\n    name: ASR\n  ocr:\n    name: OCR\n"
+        "  obstacle:\n    name: Obstacle\n  avatar_video:\n    name: Avatar Video\n"
+        "  resume_copilot:\n    name: Resume Copilot\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
     assert _primary_project_ids("video-generator：真实 ASR 后端尚未接通") == ["avatar_video"]
     assert _primary_project_ids("document-assistant OCR 优化仍未发布：等待构建") == ["resume_copilot"]
     assert set(_primary_project_ids("Judge 队列阻塞（ASR/OCR/Obstacle）：等待平台处理")) == {
-        "asr_other", "ocr", "obstacle",
+        "asr", "ocr", "obstacle",
     }
     assert _primary_project_ids("embodied-ai：Jetson 产品 VAD 下的 ASR A/B 尚未完成") == ["asr"]

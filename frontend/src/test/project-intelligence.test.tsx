@@ -34,9 +34,9 @@ const response: ProjectIntelligenceResponse = {
       change: "Jetson 验证通过", significance: "支持采用", evidence: ["session:s1"],
       confidence: "reported", source_mode: "audited" }],
     storyline: { project_id: "asr", summary: "本地方案已推进到 Jetson，下一步验证 Judge。",
-      source_mode: "audited", evidence: ["session:s1"] },
+      source_mode: "audited", evidence: ["session:s1"], source_dates: ["2026-08-09"] },
   } },
-  audit_coverage: { report_count: 9, audited_count: 8, fallback_count: 1,
+  audit_coverage: { report_count: 9, audited_count: 8, stale_last_good_count: 0, fallback_count: 1,
     failed_dates: ["2026-08-01"], last_audited_date: "2026-08-09" },
   data_quality: [], explanation: "日报审计",
 };

@@ -8,7 +8,12 @@ import re
 import subprocess
 import urllib.error
 import urllib.request
+import hashlib
+from datetime import datetime, timezone
 from typing import Any
+
+from .runtime import executable as resolve_executable
+from .model_runs import record_model_run
 
 
 def _event_ids(value: Any) -> set[str]:
@@ -63,7 +68,7 @@ def _request_openai_model(
     semantic: dict[str, Any],
     *,
     timeout: float,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     body = json.dumps({"model": model, "temperature": 0,
                        "messages": [{"role": "system", "content": _system_prompt()},
                                     {"role": "user", "content": json.dumps(semantic, ensure_ascii=False)}]},
@@ -83,11 +88,14 @@ def _request_openai_model(
         result = _json_content(content)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(f"invalid structured output: {exc}") from exc
-    return result
+    usage = outer.get("usage") if isinstance(outer.get("usage"), dict) else {}
+    return result, {"model": model, "provider": "openai-compatible", "usage": usage}
 
 
-def _request_claude_model(model: str, semantic: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    executable = os.environ.get("RD_LLM_CLAUDE_BIN", "claude")
+def _request_claude_model(
+    model: str, semantic: dict[str, Any], *, timeout: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    executable = resolve_executable("RD_LLM_CLAUDE_BIN", "claude")
     command = [
         executable, "-p", _system_prompt(), "--model", model, "--tools", "",
         "--disable-slash-commands", "--no-session-persistence", "--output-format", "json",
@@ -112,7 +120,9 @@ def _request_claude_model(model: str, semantic: dict[str, Any], *, timeout: floa
     try:
         outer = json.loads(completed.stdout)
         content = outer.get("structured_output", outer.get("result", outer))
-        return content if isinstance(content, dict) else _json_content(str(content))
+        result = content if isinstance(content, dict) else _json_content(str(content))
+        usage = outer.get("usage") if isinstance(outer.get("usage"), dict) else {}
+        return result, {"model": model, "provider": "claude-cli", "usage": usage}
     except (AttributeError, TypeError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(f"invalid structured output: {exc}") from exc
 
@@ -126,17 +136,35 @@ def enrich_semantic(semantic: dict[str, Any], *, timeout: float = 45.0) -> dict[
     if endpoint and not endpoint.endswith("/chat/completions"):
         endpoint += "/chat/completions"
     evidence_ids = _event_ids(semantic)
+    source_hash = hashlib.sha256(
+        json.dumps(semantic, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     errors: list[str] = []
     for index, model in enumerate(models):
+        started = datetime.now(timezone.utc)
+        metadata: dict[str, Any] = {}
         try:
             if endpoint:
-                result = _request_openai_model(endpoint, model, semantic, timeout=timeout)
+                result, metadata = _request_openai_model(endpoint, model, semantic, timeout=timeout)
             else:
-                result = _request_claude_model(model, semantic, timeout=timeout)
+                result, metadata = _request_claude_model(model, semantic, timeout=timeout)
             result = _validate_result(result, evidence_ids)
         except RuntimeError as exc:
+            record_model_run(
+                {"home": os.environ.get("RD_COCKPIT_HOME"), "stage": "legacy_semantic",
+                 "source_hash": source_hash, "fallback_used": index > 0,
+                 "reason": "显式请求了旧版事件账本语义摘要。"},
+                requested_model=model, metadata=metadata, status="failed", started_at=started,
+                error=f"{type(exc).__name__}: {exc}",
+            )
             errors.append(f"{model}: {exc}")
             continue
+        record_model_run(
+            {"home": os.environ.get("RD_COCKPIT_HOME"), "stage": "legacy_semantic",
+             "source_hash": source_hash, "fallback_used": index > 0,
+             "reason": "显式请求了旧版事件账本语义摘要。"},
+            requested_model=model, metadata=metadata, status="ok", started_at=started,
+        )
         return {
             "model": model,
             "primary_model": models[0],

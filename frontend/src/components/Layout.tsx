@@ -9,7 +9,7 @@ function HealthDot() {
   return (
     <span
       className="inline-flex items-center gap-1.5 text-xs text-ink2"
-      title={health.isError ? `API 不可达：${health.error.message}` : `API 正常 · ${health.data?.home ?? ""}`}
+      title={health.isError ? `API 不可达：${health.error.message}` : "API 正常"}
     >
       <span className={`h-2 w-2 rounded-full ${ok ? "bg-passed" : health.isPending ? "bg-ink3" : "bg-critical"}`} />
       API {ok ? "已连接" : health.isPending ? "连接中" : "断开"}
