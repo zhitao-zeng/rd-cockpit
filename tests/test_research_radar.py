@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import rd_cockpit.research_radar as radar
+from rd_cockpit.model_runs import model_run_summary
 
 
 def _home(tmp_path: Path) -> Path:
@@ -63,6 +65,49 @@ def _summarizer(papers: list[dict]) -> radar.SummaryResult:
     }, {"generated_count": len(papers), "missing_count": 0, "attempts": [], "fallback_used": False}, [])
 
 
+class _SummaryResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps({
+            "content": [{"type": "text", "text": json.dumps({
+                "papers": [{
+                    "id": "paper-1", "title_zh": "流式语音识别研究",
+                    "summary_zh": "论文讨论流式识别方法；此处只依据输入摘要生成导读。",
+                    "key_points_zh": ["流式识别", "部署评测"],
+                    "read_value_zh": "可用于判断是否值得阅读全文。",
+                }],
+            }, ensure_ascii=False)}],
+            "usage": {"input_tokens": 31, "output_tokens": 12},
+        }, ensure_ascii=False).encode()
+
+
+def test_research_radar_summary_records_model_usage(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("rd_cockpit.model_runner.urlopen", lambda *_args, **_kwargs: _SummaryResponse())
+    papers = [{
+        "id": "paper-1", "title": "Streaming ASR", "abstract": "private abstract text",
+        "project_id": "asr", "project_name": "ASR", "focus": "streaming",
+        "why_relevant": "current work", "local_context": [], "quality_tier": "B",
+        "relevance_score": 30, "quality_score": 20, "practical_score": 15,
+        "quality_reasons": [], "quality_risks": [],
+    }]
+
+    values, metadata = radar._request_chinese_summaries(
+        papers, "deepseek-local", home=tmp_path,
+    )
+
+    assert values["paper-1"]["title_zh"] == "流式语音识别研究"
+    assert metadata["provider"] == "anthropic-compatible"
+    summary = model_run_summary(tmp_path, days=1)
+    assert summary["tokens"]["total"] == 43
+    assert summary["runs"][0]["stage"] == "research_radar"
+    assert "private abstract text" not in json.dumps(summary)
+
+
 def test_research_radar_fetches_topics_and_uses_cache(tmp_path: Path, monkeypatch) -> None:
     home = _home(tmp_path)
     monkeypatch.setattr(radar, "load_report", lambda: {
@@ -93,6 +138,19 @@ def test_research_radar_fetches_topics_and_uses_cache(tmp_path: Path, monkeypatc
     assert second["cached"] is True
     assert second["item_count"] == 1
     assert second["items"][0]["project_id"] == "asr"
+
+
+def test_cache_only_reader_never_fetches_or_calls_a_model(tmp_path: Path, monkeypatch) -> None:
+    home = _home(tmp_path)
+    monkeypatch.setattr(radar, "_fetch_json", lambda _: (_ for _ in ()).throw(AssertionError("network")))
+    monkeypatch.setattr(radar, "_summarize_papers", lambda _: (_ for _ in ()).throw(AssertionError("model")))
+
+    result = radar.read_research_radar(home, now=datetime(2026, 8, 2, tzinfo=timezone.utc))
+
+    assert result["cached"] is True
+    assert result["stale"] is True
+    assert result["items"] == []
+    assert "后台" in result["warnings"][0]
 
 
 def test_research_radar_falls_back_to_stale_cache_on_network_error(tmp_path: Path, monkeypatch) -> None:

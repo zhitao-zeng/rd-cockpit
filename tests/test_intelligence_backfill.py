@@ -5,6 +5,8 @@ from datetime import date
 from pathlib import Path
 
 from rd_cockpit.intelligence_backfill import _record, _validate_day, backfill
+from rd_cockpit.ledger import Ledger
+from rd_cockpit.semantic_feedback import record_feedback
 
 
 def _report(day: str, project: str, task: str, result: str) -> str:
@@ -21,7 +23,18 @@ def _report(day: str, project: str, task: str, result: str) -> str:
 """
 
 
+def _configure(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "projects.yaml"
+    config.write_text(
+        "projects:\n  asr:\n    name: ASR\n  ocr:\n    name: OCR\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
+    monkeypatch.setenv("RD_COCKPIT_HOME", str(tmp_path / "cockpit"))
+
+
 def test_backfill_writes_hash_bound_sidecars_and_reuses_cache(tmp_path: Path, monkeypatch) -> None:
+    _configure(tmp_path, monkeypatch)
     (tmp_path / "2026-08-01.md").write_text(
         _report("2026-08-01", "具身智能 ASR", "本地验证", "CER 为 12.5%。"), encoding="utf-8",
     )
@@ -57,6 +70,15 @@ def test_backfill_writes_hash_bound_sidecars_and_reuses_cache(tmp_path: Path, mo
     assert sidecar["project_updates"][0]["project_id"] == "asr"
     assert sidecar["source_sha256"]
 
+    # A pre-fingerprint cache can be revalidated locally; adding cache metadata
+    # must not spend another model call for identical source evidence.
+    sidecar["schema_version"] = 1
+    sidecar.pop("prompt_version", None)
+    sidecar.pop("policy_fingerprint", None)
+    (tmp_path / "data" / "2026-08-01_intelligence_validated.json").write_text(
+        json.dumps(sidecar), encoding="utf-8",
+    )
+
     second = backfill(directory=tmp_path, days=5, batch_days=7, target=date(2026, 8, 3))
     assert second["processed"] == []
     assert second["cached"] == ["2026-08-01", "2026-08-02"]
@@ -64,7 +86,8 @@ def test_backfill_writes_hash_bound_sidecars_and_reuses_cache(tmp_path: Path, mo
     assert calls == ["codex:gpt-5.6-sol@medium"]
 
 
-def test_backfill_rejects_evidence_owned_by_another_project(tmp_path: Path) -> None:
+def test_backfill_rejects_evidence_owned_by_another_project(tmp_path: Path, monkeypatch) -> None:
+    _configure(tmp_path, monkeypatch)
     path = tmp_path / "2026-08-01.md"
     path.write_text("""# 日报 2026-08-01
 
@@ -84,3 +107,60 @@ def test_backfill_rejects_evidence_owned_by_another_project(tmp_path: Path) -> N
     validated = _validate_day(raw, record, {"asr", "ocr", "unassigned"}, {})
     assert validated["project_updates"] == []
     assert "belongs to" in validated["validation_errors"][0]
+
+
+def test_feedback_invalidates_only_its_cited_report(tmp_path: Path, monkeypatch) -> None:
+    _configure(tmp_path, monkeypatch)
+    for day in ("2026-08-01", "2026-08-02"):
+        (tmp_path / f"{day}.md").write_text(
+            _report(day, "具身智能 ASR", "验证", "CER 为 9.8%。"), encoding="utf-8",
+        )
+    calls: list[list[str]] = []
+
+    def fake_request(model, instruction):
+        calls.append([item["date"] for item in instruction["days"]])
+        output = []
+        for item in instruction["days"]:
+            last = len(item["numbered_markdown"].splitlines())
+            output.append({"date": item["date"], "unknown_updates": [], "blocker_updates": [],
+                           "breakthroughs": [], "project_updates": [{
+                               "project_id": "asr", "summary": "ASR 完成验证，CER 为 9.8%。",
+                               "evidence": [f"report:{item['date']}:L1-L{last}"],
+                           }]})
+        return {"days": output}, {"model": model}
+
+    monkeypatch.setattr("rd_cockpit.intelligence_backfill._request_any_model", fake_request)
+    backfill(directory=tmp_path, days=5, target=date(2026, 8, 3))
+    cockpit = tmp_path / "cockpit"
+    ledger = Ledger(cockpit / ".rd-cockpit" / "events.sqlite")
+    record_feedback(cockpit, ledger, {
+        "view": "storyline", "item_id": "storyline:asr", "project_id": "asr",
+        "rating": "incorrect", "text": "摘要有误", "source_dates": ["2026-08-01"],
+    })
+    ledger.close()
+
+    result = backfill(directory=tmp_path, days=5, target=date(2026, 8, 3))
+
+    assert calls == [["2026-08-01", "2026-08-02"], ["2026-08-01"]]
+    assert result["processed"] == ["2026-08-01"]
+    assert result["cached"] == ["2026-08-02"]
+
+
+def test_quality_gate_rejects_empty_semantic_snapshot(tmp_path: Path, monkeypatch) -> None:
+    _configure(tmp_path, monkeypatch)
+    (tmp_path / "2026-08-01.md").write_text(
+        _report("2026-08-01", "具身智能 ASR", "验证", "CER 为 9.8%。"), encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "rd_cockpit.intelligence_backfill._request_any_model",
+        lambda model, instruction: ({"days": [{
+            "date": "2026-08-01", "unknown_updates": [], "blocker_updates": [],
+            "breakthroughs": [], "project_updates": [],
+        }]}, {"model": model}),
+    )
+
+    result = backfill(directory=tmp_path, days=5, target=date(2026, 8, 2))
+
+    assert len(result["failed"]) == 1
+    assert "quality gate rejected" in result["failed"][0]["error"]
+    assert not (tmp_path / "data" / "2026-08-01_intelligence_validated.json").exists()

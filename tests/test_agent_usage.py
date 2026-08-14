@@ -3,7 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from rd_cockpit.agent_usage import _project_for_cwd
+from rd_cockpit.agent_usage import _project_for_cwd, sync_usage
+from rd_cockpit.ledger import Ledger
 
 
 def _git_init(path: Path) -> None:
@@ -81,3 +82,44 @@ def test_recent_paths_win_when_a_long_session_switches_projects(tmp_path: Path) 
     assert _project_for_cwd(
         home, str(workspace), observed_paths=observed_paths,
     ) == "new_project"
+
+
+def test_usage_sync_skips_unchanged_transcripts(tmp_path: Path, monkeypatch) -> None:
+    user = tmp_path / "user"
+    sessions = user / ".codex" / "sessions"
+    sessions.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "cockpit"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "projects.yaml").write_text(
+        f"projects:\n  demo:\n    repo_path: {repo}\n", encoding="utf-8",
+    )
+    transcript = sessions / "session.jsonl"
+    transcript.write_text(
+        '{"type":"session_meta","payload":{"id":"session-1","cwd":"' + str(repo) + '"}}\n'
+        '{"type":"event_msg","timestamp":"2026-08-14T01:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: user))
+    ledger = Ledger(home / ".rd-cockpit" / "events.sqlite")
+    first = sync_usage(ledger, home, days=30)
+    second = sync_usage(ledger, home, days=30)
+    assert first["parsed"] == 1
+    assert first["inserted"] == 1
+    assert second["parsed"] == 0
+    assert second["unchanged"] == 1
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(
+            '{"type":"event_msg","timestamp":"2026-08-14T01:05:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}}}\n'
+        )
+    third = sync_usage(ledger, home, days=30)
+    assert third["parsed"] == 1
+    latest = ledger.db.execute(
+        "SELECT payload_json FROM current_session_usage WHERE agent='codex' AND session_id='session-1'"
+    ).fetchone()
+    assert latest is not None
+    assert __import__("json").loads(latest["payload_json"])["total_tokens"] == 24
+    assert ledger.events(event_types={"agent_usage_observed"}) == []
+    assert ledger.events(event_types={"agent_usage_settled"})
+    ledger.close()

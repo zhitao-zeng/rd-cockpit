@@ -12,40 +12,58 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from .daily_audit import _json_object, _numbers, unpack_model_output
+from .artifact_cache import atomic_write_json, sha256_path
+from .daily_audit import _json_object, _numbers
 from .daily_source import (
     _detail_project_ids,
     _project_ids,
     available_report_dates,
     parse_report,
-    project_display_names,
     report_directory,
 )
-from .runtime import executable as resolve_executable
+from .project_identity import (
+    canonical_project_ids, canonicalize_report, registered_project_names,
+)
+from .semantic_feedback import feedback_fingerprint, feedback_for_records
+from .model_runner import run_claude_json, run_codex_json
 
 
 FIELDS = ("unknown_updates", "blocker_updates", "breakthroughs", "project_updates")
+SCHEMA_VERSION = 2
+PROMPT_VERSION = 2
 REF_RE = re.compile(r"^report:(\d{4}-\d{2}-\d{2}):L(\d+)-L(\d+)$")
 DEFAULT_MODEL = "codex:gpt-5.6-sol@medium"
 DEFAULT_FALLBACK = "deepseek-local"
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    atomic_write_json(path, value)
 
 
 def _source_sha(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return sha256_path(path)
+
+
+def attribution_fingerprint(report: dict[str, Any]) -> str:
+    """Hash parsed project ownership, including cached classifier decisions."""
+    value = [{
+        "group": str(group.get("title") or ""),
+        "tasks": [{
+            "title": str(task.get("title") or ""),
+            "project_ids": list(task.get("project_ids") or []),
+            "classification": {
+                key: (task.get("classification") or {}).get(key)
+                for key in ("source", "model", "confidence")
+            },
+        } for task in group.get("tasks") or []],
+    } for group in report.get("groups") or []]
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _strings(value: Any) -> list[str]:
@@ -74,12 +92,14 @@ def _line_owners(lines: list[str], report_projects: list[str]) -> dict[int, set[
             section = text[3:].strip()
             group_ids, task_ids = [], []
         elif section == "核心进展" and text.startswith("### ") and not text.startswith("#### "):
-            group_ids = _project_ids(text[4:])
+            group_ids = canonical_project_ids(_project_ids(text[4:]), default_unassigned=False)
             task_ids = []
         elif section == "核心进展" and text.startswith("#### "):
-            task_ids = _project_ids(text[5:]) or group_ids
-        detailed = _detail_project_ids(text)
-        explicit = detailed or _project_ids(text)
+            task_ids = canonical_project_ids(
+                _project_ids(text[5:]), default_unassigned=False,
+            ) or group_ids
+        detailed = canonical_project_ids(_detail_project_ids(text), default_unassigned=False)
+        explicit = detailed or canonical_project_ids(_project_ids(text), default_unassigned=False)
         if section == "核心进展":
             # A task heading owns its body.  Concrete paths only refine an
             # unclassified/generic heading; incidental paths in prose must not
@@ -98,28 +118,41 @@ def _line_owners(lines: list[str], report_projects: list[str]) -> dict[int, set[
 
 def _record(path: Path) -> dict[str, Any]:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    parsed = parse_report(path)
+    parsed = canonicalize_report(parse_report(path))
     project_ids = [value for value in parsed.get("project_ids", []) if value != "unassigned"]
     return {
         "date": str(parsed.get("date") or path.stem),
         "path": path,
         "source_sha256": _source_sha(path),
+        "attribution_fingerprint": attribution_fingerprint(parsed),
         "lines": lines,
         "project_ids": project_ids,
+        "task_count": int(parsed.get("task_count") or 0),
+        "unmapped_project_ids": list(parsed.get("unmapped_project_ids") or []),
         "owners": _line_owners(lines, project_ids),
         "numbered_markdown": "\n".join(f"L{index}: {line}" for index, line in enumerate(lines, 1)),
     }
 
 
 def _instruction(records: list[dict[str, Any]], state: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
+    feedback = []
+    seen_feedback: set[str] = set()
+    for record in records:
+        for item in record.get("feedback") or []:
+            event_id = str(item.get("event_id") or "")
+            if event_id and event_id not in seen_feedback:
+                seen_feedback.add(event_id)
+                feedback.append(item)
     return {
-        "project_catalog": [{"id": key, "name": value} for key, value in project_display_names().items()],
+        "project_catalog": [{"id": key, "name": value}
+                            for key, value in registered_project_names().items()],
         "previous_open_unknowns": list(state["unknown"].values()),
         "previous_open_blockers": list(state["blocker"].values()),
         "days": [{
             "date": item["date"], "project_ids": item["project_ids"],
             "numbered_markdown": item["numbered_markdown"],
         } for item in records],
+        "user_feedback": feedback,
         "output_schema": {"days": [{
             "date": "YYYY-MM-DD",
             "unknown_updates": [{"project_id": "one catalog id", "unknown_id": "stable id when known",
@@ -145,71 +178,55 @@ def _instruction(records: list[dict[str, Any]], state: dict[str, dict[str, dict[
             "Breakthroughs must change a metric, verification stage, conclusion or research direction; commits and builds alone do not qualify.",
             "At most one project_update per substantive project per day. Return empty arrays for no activity.",
             "Reuse the supplied stable ID when updating or resolving a previous open item.",
+            "User feedback is an evaluation signal, not a factual source. Correct the cited failure only when the Markdown evidence supports the correction.",
+            "For noise or incorrect feedback, omit the unsupported item. For missing feedback, recover only evidence-backed content. For wrong_project feedback, use corrected_project_id only when the cited lines support it.",
             "Return JSON only.",
         ],
     }
 
 
-def _request_codex(model_spec: str, instruction: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    model_and_effort = model_spec.removeprefix("codex:")
-    model, separator, reasoning = model_and_effort.partition("@")
-    if not separator:
-        reasoning = "medium"
-    executable = resolve_executable("RD_INTELLIGENCE_CODEX_BIN", "codex")
-    timeout = float(os.environ.get("RD_INTELLIGENCE_MODEL_TIMEOUT", "1200"))
+def _run_context(model_spec: str, instruction: dict[str, Any], stage: str) -> dict[str, Any]:
+    return {
+        "home": os.environ.get("RD_COCKPIT_HOME"), "stage": stage,
+        "source_hash": hashlib.sha256(
+            json.dumps(instruction, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "fallback_used": model_spec != DEFAULT_MODEL,
+        "reason": "新增或变更的日报语义证据需要离线提炼。",
+    }
+
+
+def _request_codex(
+    model_spec: str, instruction: dict[str, Any], *, stage: str = "intelligence",
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prompt = (
         "你是研发项目情报审计器。审计标准输入中的多日日报，严格遵守 output_schema 和 rules，"
         "只返回一个 JSON 对象。不要重写日报，不要把待办、提交或一般工作包装成研究突破。"
     )
-    with tempfile.TemporaryDirectory(prefix="rd-intelligence-") as temporary:
-        message = Path(temporary) / "message.json"
-        command = [
-            executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--skip-git-repo-check", "--sandbox", "read-only", "--model", model,
-            "-c", 'model_provider="openai"', "-c", f'model_reasoning_effort="{reasoning}"',
-            "-C", str(Path(__file__).resolve().parents[1]), "--json",
-            "--output-last-message", str(message), prompt,
-        ]
-        try:
-            completed = subprocess.run(command, input=json.dumps(instruction, ensure_ascii=False),
-                                       text=True, capture_output=True, timeout=timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError(f"Codex request failed: {exc}") from exc
-        if completed.returncode:
-            raise RuntimeError(f"Codex exited with {completed.returncode}: {completed.stderr[-300:]}")
-        result = _json_object(message.read_text(encoding="utf-8", errors="replace"))
-        usage: dict[str, Any] = {}
-        for line in completed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-                usage = event["usage"]
-    return result, {"model": model_spec, "provider": "codex-cli", "reasoning_effort": reasoning, "usage": usage}
+    return run_codex_json(
+        model_spec, instruction, prompt=prompt, executable_env="RD_INTELLIGENCE_CODEX_BIN",
+        timeout_env="RD_INTELLIGENCE_MODEL_TIMEOUT", default_timeout=1200,
+        workdir=Path(__file__).resolve().parents[1], temp_prefix="rd-intelligence-",
+        run_context=_run_context(model_spec, instruction, stage),
+    )
 
 
-def _request_claude(model: str, instruction: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    executable = os.environ.get("RD_INTELLIGENCE_CLAUDE_BIN", "claude")
-    timeout = float(os.environ.get("RD_INTELLIGENCE_MODEL_TIMEOUT", "1200"))
+def _request_claude(
+    model: str, instruction: dict[str, Any], *, stage: str = "intelligence",
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prompt = "你是研发项目情报审计器。严格按输入 schema 返回纯 JSON，所有结论必须引用日报行号。"
-    command = [executable, "-p", prompt, "--model", model, "--tools", "", "--disable-slash-commands",
-               "--no-session-persistence", "--output-format", "json"]
-    try:
-        completed = subprocess.run(command, input=json.dumps(instruction, ensure_ascii=False),
-                                   text=True, capture_output=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Claude route failed: {exc}") from exc
-    if completed.returncode:
-        raise RuntimeError(f"Claude route exited with {completed.returncode}: {completed.stderr[-300:]}")
-    outer = _json_object(completed.stdout)
-    value, metadata = unpack_model_output(outer)
-    result = value if isinstance(value, dict) else _json_object(str(value))
-    return result, {"model": model, "provider": "claude-router", **metadata}
+    return run_claude_json(
+        model, instruction, prompt=prompt, executable_env="RD_INTELLIGENCE_CLAUDE_BIN",
+        timeout_env="RD_INTELLIGENCE_MODEL_TIMEOUT", default_timeout=1200,
+        run_context=_run_context(model, instruction, stage),
+    )
 
 
-def _request_any_model(model: str, instruction: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    return _request_codex(model, instruction) if model.startswith("codex:") else _request_claude(model, instruction)
+def _request_any_model(
+    model: str, instruction: dict[str, Any], *, stage: str = "intelligence",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return (_request_codex(model, instruction, stage=stage) if model.startswith("codex:")
+            else _request_claude(model, instruction, stage=stage))
 
 
 def _refs(value: Any, record: dict[str, Any], project_id: str, label: str) -> tuple[list[str], str, list[str]]:
@@ -229,7 +246,10 @@ def _refs(value: Any, record: dict[str, Any], project_id: str, label: str) -> tu
             rejected.append(f"evidence range outside report: {ref}")
             continue
         owners = set().union(*(record["owners"].get(line, set()) for line in range(start, end + 1)))
-        if owners and project_id not in owners:
+        generic_asr_owner = owners == {"asr_other"} and (
+            project_id == "asr" or project_id.startswith("asr_")
+        )
+        if owners and project_id not in owners and not generic_asr_owner:
             rejected.append(f"evidence {ref} belongs to {sorted(owners)}, not {project_id}")
             continue
         accepted.append(ref)
@@ -287,9 +307,44 @@ def _validate_day(raw: dict[str, Any], record: dict[str, Any], valid: set[str], 
                 validation_errors.extend(f"{label}: removed {reason}" for reason in rejected_refs)
             except ValueError as exc:
                 validation_errors.append(f"{label}: removed item: {exc}")
-    return {"schema_version": 1, "date": record["date"], "source_path": str(record["path"]),
-            "source_sha256": record["source_sha256"], **output,
+    return {"schema_version": SCHEMA_VERSION, "prompt_version": PROMPT_VERSION,
+            "policy_fingerprint": metadata.get("policy_fingerprint"),
+            "feedback_fingerprint": record.get("feedback_fingerprint"),
+            "date": record["date"], "source_path": str(record["path"]),
+            "source_sha256": record["source_sha256"],
+            "attribution_fingerprint": record["attribution_fingerprint"], **output,
             "validation_errors": validation_errors, "model_run": metadata}
+
+
+def _quality_gate(day: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """Reject a semantic snapshot that is structurally valid but not useful."""
+    accepted = sum(len(day.get(field) or []) for field in FIELDS)
+    errors = len(day.get("validation_errors") or [])
+    project_updates = len(day.get("project_updates") or [])
+    texts: list[str] = []
+    for field, key in (
+        ("unknown_updates", "question"), ("blocker_updates", "blocker"),
+        ("breakthroughs", "change"), ("project_updates", "summary"),
+    ):
+        texts.extend(str(item.get(key) or "").strip().casefold()
+                     for item in day.get(field) or [] if str(item.get(key) or "").strip())
+    duplicate_ratio = 0.0 if not texts else 1.0 - len(set(texts)) / len(texts)
+    reasons = []
+    if record.get("task_count", 0) and record.get("project_ids") and project_updates == 0:
+        reasons.append("日报有可读项目任务，但没有任何项目段落总结")
+    if errors > max(3, accepted * 2):
+        reasons.append(f"被校验移除的候选过多（{errors} 个错误 / {accepted} 个保留）")
+    if len(texts) >= 3 and duplicate_ratio > 0.5:
+        reasons.append(f"摘要重复率过高（{duplicate_ratio:.0%}）")
+    result = {
+        "passed": not reasons, "accepted_items": accepted,
+        "validation_error_count": errors, "duplicate_ratio": round(duplicate_ratio, 3),
+        "unmapped_project_labels": len(record.get("unmapped_project_ids") or []),
+        "reasons": reasons,
+    }
+    if reasons:
+        raise ValueError("quality gate rejected: " + "; ".join(reasons))
+    return result
 
 
 def _apply_state(state: dict[str, dict[str, dict[str, Any]]], day: dict[str, Any]) -> None:
@@ -311,6 +366,46 @@ def _sidecar(root: Path, day: str) -> Path:
     return root / "data" / f"{day}_intelligence_validated.json"
 
 
+def _cached_day(
+    root: Path, existing: dict[str, Any] | None, record: dict[str, Any],
+    valid: set[str], policy: str, models: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if not existing or existing.get("source_sha256") != record["source_sha256"]:
+        return None
+    stored_feedback = existing.get("feedback_fingerprint")
+    expected_feedback = record.get("feedback_fingerprint")
+    if stored_feedback != expected_feedback and not (
+        stored_feedback is None and not record.get("feedback")
+    ):
+        return None
+    attribution_matches = (
+        existing.get("attribution_fingerprint") == record.get("attribution_fingerprint")
+    )
+    if (
+        existing.get("schema_version") == SCHEMA_VERSION
+        and existing.get("prompt_version") == PROMPT_VERSION
+        and existing.get("policy_fingerprint") == policy
+        and attribution_matches
+    ):
+        return existing
+    metadata = existing.get("model_run") if isinstance(existing.get("model_run"), dict) else {}
+    if str(metadata.get("model") or "") not in models:
+        return None
+    try:
+        upgraded = _validate_day(
+            existing, record, valid,
+            {**metadata, "policy_fingerprint": policy, "prompt_version": PROMPT_VERSION},
+        )
+        upgraded["quality_gate"] = _quality_gate(upgraded, record)
+    except ValueError:
+        return None
+    upgraded["cache_migration"] = {
+        "from_schema": existing.get("schema_version"), "model_call": False,
+    }
+    _write_json(_sidecar(root, record["date"]), upgraded)
+    return upgraded
+
+
 def backfill(
     *, directory: Path | None = None, days: int = 90, batch_days: int = 7,
     model: str = DEFAULT_MODEL, fallback_model: str = DEFAULT_FALLBACK,
@@ -321,7 +416,31 @@ def backfill(
     since = (target - timedelta(days=max(1, days) - 1)).isoformat()
     dates = [value for value in available_report_dates(root) if since <= value <= target.isoformat()]
     records = [_record(root / f"{day}.md") for day in dates]
-    valid = set(project_display_names()) | {"unassigned"}
+    cockpit_home = Path(os.environ.get("RD_COCKPIT_HOME") or Path(__file__).resolve().parents[1])
+    feedback_database = cockpit_home / ".rd-cockpit" / "events.sqlite"
+    if feedback_database.is_file():
+        from .ledger import Ledger
+        ledger = Ledger(feedback_database, readonly=True)
+        try:
+            for record in records:
+                record["feedback"] = feedback_for_records(ledger, [record])
+                record["feedback_fingerprint"] = feedback_fingerprint(record["feedback"])
+        finally:
+            ledger.close()
+    else:
+        for record in records:
+            record["feedback"] = []
+            record["feedback_fingerprint"] = feedback_fingerprint(())
+    valid = set(registered_project_names())
+    from .semantic_policy import catalog_fingerprint, policy_fingerprint
+    policy = policy_fingerprint(
+        "project-intelligence-backfill",
+        schema_version=SCHEMA_VERSION,
+        prompt_version=PROMPT_VERSION,
+        models=(model, fallback_model),
+        extra={"catalog": catalog_fingerprint(registered_project_names())},
+    )
+    policy_models = tuple(value for value in (model, fallback_model) if value)
     state: dict[str, dict[str, dict[str, Any]]] = {"unknown": {}, "blocker": {}}
     processed: list[str] = []
     cached: list[str] = []
@@ -336,9 +455,12 @@ def backfill(
             existing = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else None
         except json.JSONDecodeError:
             existing = None
-        if not force and existing and existing.get("source_sha256") == record["source_sha256"]:
+        accepted_cache = None if force else _cached_day(
+            root, existing, record, valid, policy, policy_models,
+        )
+        if accepted_cache is not None:
             cached.append(record["date"])
-            _apply_state(state, existing)
+            _apply_state(state, accepted_cache)
             index += 1
             continue
         batch = []
@@ -351,7 +473,7 @@ def backfill(
                     value = json.loads(candidate_sidecar.read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     value = {}
-                if value.get("source_sha256") == candidate["source_sha256"]:
+                if _cached_day(root, value, candidate, valid, policy, policy_models) is not None:
                     break
             candidate_size = len(candidate["numbered_markdown"].encode())
             if batch and size + candidate_size > 150_000:
@@ -368,8 +490,12 @@ def backfill(
             calls += 1
             try:
                 raw, metadata = _request_any_model(selected_model, instruction)
+                metadata = {**(metadata or {}), "policy_fingerprint": policy,
+                            "prompt_version": PROMPT_VERSION}
                 by_date = {str(item.get("date")): item for item in raw.get("days", []) if isinstance(item, dict)}
                 validated = [_validate_day(by_date.get(item["date"], {}), item, valid, metadata) for item in batch]
+                for value, item in zip(validated, batch, strict=True):
+                    value["quality_gate"] = _quality_gate(value, item)
                 for value in validated:
                     _write_json(_sidecar(root, value["date"]), value)
                     processed.append(value["date"])

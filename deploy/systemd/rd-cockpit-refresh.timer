@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh R&D Cockpit after the nightly Daily Report
+
+[Timer]
+OnCalendar=*-*-* 01:15:00 Asia/Shanghai
+Persistent=true
+Unit=rd-cockpit-refresh.service
+
+[Install]
+WantedBy=timers.target

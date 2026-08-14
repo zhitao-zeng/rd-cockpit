@@ -17,6 +17,9 @@ from typing import Any
 from .config import load_config
 from .daily_source import _project_ids, iter_reports
 from .daily_supplement import load_supplement
+from .project_identity import (
+    canonical_project_ids, canonicalize_report, visible_project_names,
+)
 
 PHASES = ("探索", "实现", "执行", "验证", "交付", "运维")
 PHASE_WORDS = {
@@ -122,18 +125,7 @@ def _similarity(left: str, right: str) -> float:
 
 
 def _project_names(home: Path) -> dict[str, str]:
-    config = load_config(home / "config" / "projects.yaml")
-    names = {key: str(value.get("name") or key) for key, value in config.get("projects", {}).items()}
-    names.update({"asr_other": "ASR / 其他", "avatar_video": "视频生成与理解",
-                  "investment_research": "投资研究", "music_voice": "音乐与语音生成",
-                  "llm_inference": "LLM 推理服务", "research_tools": "研发工具",
-                  "infrastructure": "研发基础设施", "embodied_platform": "Embodied AI / 平台部署",
-                  "autonomous_driving": "自动驾驶工具链", "idol": "Idol 生成",
-                  "workspace": "项目文档与工作区", "router": "路由服务",
-                  "image_identify": "图像鉴伪 / Image Identify", "menu_translate": "菜单图片翻译",
-                  "image_generation": "图像生成 API",
-                  "unassigned": "其他 / 未归类"})
-    return names
+    return visible_project_names(home)
 
 
 def _configured_lifecycle_statuses(home: Path) -> dict[str, str]:
@@ -155,11 +147,11 @@ def _primary_project_ids(text: str) -> list[str]:
     """
     prefix = re.split(r"[:：]", text, maxsplit=1)[0].strip()
     leading = re.split(r"[\s（(\[/]", prefix, maxsplit=1)[0].strip("-—")
-    leading_ids = [project_id for project_id in _project_ids(leading) if project_id != "asr_other"]
+    leading_ids = canonical_project_ids(_project_ids(leading), default_unassigned=False)
     if leading_ids:
         return leading_ids
-    prefix_ids = _project_ids(prefix)
-    return prefix_ids or _project_ids(text)
+    prefix_ids = canonical_project_ids(_project_ids(prefix), default_unassigned=False)
+    return prefix_ids or canonical_project_ids(_project_ids(text), default_unassigned=False)
 
 
 def _task_nodes(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -283,7 +275,7 @@ def _lifecycles(nodes: list[dict[str, Any]], names: dict[str, str], reports: lis
 def _effort(nodes: list[dict[str, Any]], reports: list[dict[str, Any]], names: dict[str, str]) -> list[dict[str, Any]]:
     values: dict[str, dict[str, Any]] = defaultdict(lambda: {"tokens": 0, "agent_minutes": 0.0})
     for report in reports:
-        supplement = load_supplement(report["date"])
+        supplement = report.get("_supplement") or load_supplement(report["date"])
         for project in supplement.get("projects", []):
             item = values[project["project_id"]]
             item["tokens"] += int(project.get("tokens", 0) or 0)
@@ -307,7 +299,7 @@ def _activity(nodes: list[dict[str, Any]], reports: list[dict[str, Any]], names:
     for node in nodes:
         by_day[node["date"]][node["project_id"]] += 1
     for report in reports:
-        supplement = load_supplement(report["date"])
+        supplement = report.get("_supplement") or load_supplement(report["date"])
         for project in supplement.get("projects", []):
             tokens[report["date"]][project["project_id"]] += int(project.get("tokens", 0) or 0)
     dates = sorted({*by_day, *tokens})
@@ -344,7 +336,9 @@ def _plans(reports: list[dict[str, Any]]) -> dict[str, Any]:
             counts[status] += 1
             day_counts[status] += 1
             items.append({"date": report["date"], "text": text, "status": status,
-                          "project_ids": _project_ids(text)})
+                          "project_ids": canonical_project_ids(
+                              _project_ids(text), default_unassigned=False,
+                          )})
         if day_counts:
             daily.append({"date": report["date"], "counts": dict(day_counts)})
     return {"counts": dict(counts), "items": list(reversed(items[-40:])), "daily": daily,
@@ -358,7 +352,9 @@ def _knowledge(reports: list[dict[str, Any]], nodes: list[dict[str, Any]], names
     candidates = []
     for report in reports:
         for text in report.get("knowledge", []):
-            candidates.append((report["date"], text, _project_ids(text)))
+            candidates.append((report["date"], text, canonical_project_ids(
+                _project_ids(text), default_unassigned=False,
+            )))
     for node in nodes:
         for conclusion in node["conclusions"][:2]:
             candidates.append((node["date"], conclusion, [node["project_id"]]))
@@ -388,8 +384,14 @@ def _time_travel(reports: list[dict[str, Any]], nodes: list[dict[str, Any]], nam
                 continue
             last_result_node = next((node for node in reversed(known) if node["results"]), None)
             future = next((node for node in nodes if node["project_id"] == project_id and node["date"] > report["date"] and node["results"]), None)
-            blockers = [text for text in report.get("blockers", []) if project_id in _project_ids(text)]
-            next_items = [text for text in report.get("next", []) if project_id in _project_ids(text)]
+            blockers = [text for text in report.get("blockers", [])
+                        if project_id in canonical_project_ids(
+                            _project_ids(text), default_unassigned=False,
+                        )]
+            next_items = [text for text in report.get("next", [])
+                          if project_id in canonical_project_ids(
+                              _project_ids(text), default_unassigned=False,
+                          )]
             projects.append({"project_id": project_id, "name": names.get(project_id, project_id),
                              "phase": known[-1]["phase"], "latest_task": known[-1]["title"],
                              "latest_result": last_result_node["results"][0] if last_result_node else None,
@@ -405,7 +407,9 @@ def _time_travel(reports: list[dict[str, Any]], nodes: list[dict[str, Any]], nam
 def development_dashboard(home: Path, *, days: int = 90, target: date | None = None) -> dict[str, Any]:
     target = target or date.today()
     since = (target - timedelta(days=max(1, days) - 1)).isoformat()
-    reports = [report for report in iter_reports(since=since) if report.get("date") and report["date"] <= target.isoformat()]
+    reports = [canonicalize_report(report, home)
+               for report in iter_reports(since=since, cache_home=home)
+               if report.get("date") and report["date"] <= target.isoformat()]
     names = _project_names(home)
     nodes = _task_nodes(reports)
     active_ids = sorted({node["project_id"] for node in nodes})
@@ -424,5 +428,139 @@ def development_dashboard(home: Path, *, days: int = 90, target: date | None = N
         "plans": _plans(reports),
         "knowledge": _knowledge(reports, nodes, names),
         "time_travel": _time_travel(reports, nodes, names),
+        "project_identity": {
+            "registered": len(names) - 1,
+            "unmapped_ids": sorted({
+                value for report in reports for value in report.get("unmapped_project_ids", [])
+            }),
+        },
         "explanation": "所有可读节点来自正式日报；相似任务线为标题相似度推断，指标只提取明确写出的数值。",
+    }
+
+
+def development_summary_view(dashboard: dict[str, Any]) -> dict[str, Any]:
+    """Return the compact first-screen payload used by the browser."""
+    storylines = dashboard.get("storylines") or {}
+    return {
+        "generated_for": dashboard.get("generated_for"),
+        "days": dashboard.get("days"),
+        "source": dashboard.get("source"),
+        "report_count": dashboard.get("report_count", 0),
+        "project_names": dashboard.get("project_names") or {},
+        "lifecycles": dashboard.get("lifecycles") or [],
+        "effort_output": dashboard.get("effort_output") or [],
+        "activity": dashboard.get("activity") or {"dates": [], "projects": []},
+        "counts": {
+            "nodes": sum(len(items) for items in storylines.values()),
+            "projects": sum(bool(items) for key, items in storylines.items() if key != "unassigned"),
+            "metrics": len(dashboard.get("metrics") or []),
+            "plans": int((dashboard.get("plans") or {}).get("total", 0) or 0),
+        },
+        "project_identity": dashboard.get("project_identity") or {"registered": 0, "unmapped_ids": []},
+        "explanation": dashboard.get("explanation"),
+    }
+
+
+def development_project_view(
+    dashboard: dict[str, Any], project_id: str, *, timeline_limit: int = 120,
+) -> dict[str, Any]:
+    storylines = dashboard.get("storylines") or {}
+    all_nodes = list(storylines.get(project_id) or [])
+    limit = max(12, min(int(timeline_limit), 500))
+    lifecycle = next(
+        (item for item in dashboard.get("lifecycles") or [] if item.get("project_id") == project_id),
+        None,
+    )
+    effort = next(
+        (item for item in dashboard.get("effort_output") or [] if item.get("project_id") == project_id),
+        None,
+    )
+    activity = dashboard.get("activity") or {"dates": [], "projects": []}
+    project_activity = [
+        item for item in activity.get("projects") or [] if item.get("project_id") == project_id
+    ]
+    latest_snapshot = None
+    for snapshot in reversed(dashboard.get("time_travel") or []):
+        project = next(
+            (item for item in snapshot.get("projects") or [] if item.get("project_id") == project_id),
+            None,
+        )
+        if project:
+            latest_snapshot = {"date": snapshot.get("date"), "project": project}
+            break
+    return {
+        "generated_for": dashboard.get("generated_for"),
+        "days": dashboard.get("days"),
+        "project_id": project_id,
+        "project_name": (dashboard.get("project_names") or {}).get(project_id, project_id),
+        "storyline": all_nodes[-limit:],
+        "timeline_total": len(all_nodes),
+        "timeline_limit": limit,
+        "threads": list((dashboard.get("threads") or {}).get(project_id) or [])[:16],
+        "metrics": [
+            item for item in dashboard.get("metrics") or [] if item.get("project_id") == project_id
+        ],
+        "lifecycle": lifecycle,
+        "effort": effort,
+        "activity": {"dates": activity.get("dates") or [], "projects": project_activity},
+        "latest_snapshot": latest_snapshot,
+        "explanation": dashboard.get("explanation"),
+    }
+
+
+def development_global_view(dashboard: dict[str, Any]) -> dict[str, Any]:
+    """Return global secondary views without duplicating project timelines."""
+    return {
+        "generated_for": dashboard.get("generated_for"),
+        "days": dashboard.get("days"),
+        "plans": dashboard.get("plans") or {"counts": {}, "items": [], "daily": [], "total": 0},
+        "explanation": dashboard.get("explanation"),
+    }
+
+
+def development_timeline_view(
+    dashboard: dict[str, Any], *, project_id: str | None = None,
+    offset: int = 0, limit: int = 50,
+) -> dict[str, Any]:
+    """Page readable Daily Report nodes newest-first."""
+    storylines = dashboard.get("storylines") or {}
+    if project_id:
+        items = list(storylines.get(project_id) or [])
+    else:
+        items = [item for values in storylines.values() for item in values]
+    items.sort(key=lambda item: (str(item.get("date") or ""), str(item.get("id") or "")), reverse=True)
+    start = max(0, int(offset))
+    size = max(1, min(int(limit), 200))
+    page = items[start:start + size]
+    return {
+        "project_id": project_id,
+        "offset": start,
+        "limit": size,
+        "total": len(items),
+        "has_more": start + len(page) < len(items),
+        "items": page,
+    }
+
+
+def development_history_view(
+    dashboard: dict[str, Any], *, offset: int = 0, limit: int = 10,
+) -> dict[str, Any]:
+    """Page historical knowledge snapshots without returning the whole year."""
+    snapshots = list(reversed(dashboard.get("time_travel") or []))
+    start = max(0, int(offset))
+    size = max(1, min(int(limit), 31))
+    page = [{
+        "date": snapshot.get("date"),
+        "projects": [{
+            key: project.get(key) for key in (
+                "project_id", "name", "phase", "latest_task", "latest_result", "blockers",
+            )
+        } for project in snapshot.get("projects") or []],
+    } for snapshot in snapshots[start:start + size]]
+    return {
+        "offset": start,
+        "limit": size,
+        "total": len(snapshots),
+        "has_more": start + len(page) < len(snapshots),
+        "items": page,
     }

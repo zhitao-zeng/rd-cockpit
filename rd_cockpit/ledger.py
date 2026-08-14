@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
+
+
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def utc_now() -> str:
@@ -26,6 +31,7 @@ class Ledger:
         *,
         timeout_seconds: float = 30.0,
         max_retries: int = 5,
+        readonly: bool = False,
     ):
         self.path = path
         self.timeout_seconds = max(0.001, float(timeout_seconds))
@@ -34,67 +40,36 @@ class Ledger:
         # Collectors and hooks may write at the same time.  SQLite WAL handles
         # that well as long as short-lived writers wait for one another rather
         # than failing immediately when the usage sampler owns the lock.
-        self.db = sqlite3.connect(path, timeout=self.timeout_seconds)
+        self.readonly = readonly
+        self.db = sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro" if readonly else str(path),
+            uri=readonly,
+            timeout=self.timeout_seconds,
+        )
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        if not readonly:
+            self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute(f"PRAGMA busy_timeout={max(1, int(self.timeout_seconds * 1000))}")
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self._schema()
+        if readonly:
+            self.db.execute("PRAGMA query_only=ON")
+        else:
+            self.db.execute("PRAGMA synchronous=NORMAL")
+            self._schema()
+        # The ledger contains local paths, resource processes and usage totals.
+        # Keep it private even when the repository itself lives in a shared
+        # group-readable workspace.
+        for private_path in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+            if private_path.exists():
+                os.chmod(private_path, 0o600)
 
     def close(self) -> None:
         self.db.close()
 
     def _schema(self) -> None:
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-              event_id TEXT PRIMARY KEY,
-              occurred_at TEXT NOT NULL,
-              ingested_at TEXT NOT NULL,
-              event_type TEXT NOT NULL,
-              project_id TEXT,
-              task_id TEXT,
-              session_id TEXT,
-              source TEXT NOT NULL,
-              machine TEXT,
-              repo_path TEXT,
-              commit_sha TEXT,
-              dirty INTEGER,
-              status TEXT,
-              provenance TEXT NOT NULL CHECK(provenance IN ('observed','reported','inferred')),
-              verification TEXT NOT NULL DEFAULT 'unverified',
-              payload_json TEXT NOT NULL DEFAULT '{}',
-              dedup_key TEXT UNIQUE,
-              supersedes TEXT,
-              retraction_reason TEXT,
-              schema_version INTEGER NOT NULL DEFAULT 1
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_time ON events(occurred_at);
-            CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, occurred_at);
-            CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, occurred_at);
-            CREATE INDEX IF NOT EXISTS idx_events_commit ON events(commit_sha);
-            CREATE INDEX IF NOT EXISTS idx_events_supersedes ON events(supersedes);
-            CREATE TABLE IF NOT EXISTS evidence (
-              evidence_id TEXT PRIMARY KEY,
-              event_id TEXT NOT NULL REFERENCES events(event_id),
-              evidence_type TEXT NOT NULL,
-              path TEXT,
-              sha256 TEXT,
-              metadata_json TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_evidence_event ON evidence(event_id);
-            CREATE TABLE IF NOT EXISTS report_runs (
-              report_id TEXT PRIMARY KEY,
-              report_date TEXT NOT NULL,
-              generated_at TEXT NOT NULL,
-              output_json TEXT,
-              output_markdown TEXT,
-              output_html TEXT
-            );
-            """
-        )
-        self.db.commit()
+        from .migrations import migrate
+
+        migrate(self.db, self.path)
 
     def append(
         self,
@@ -164,8 +139,48 @@ class Ledger:
                 time.sleep(0.05 * (2 ** attempt))
         raise RuntimeError("unreachable ledger append retry state")
 
+    def record_agent_activity(
+        self, *, source: str, session_id: str, project_id: str | None,
+        semantic_kind: str, failed: bool, duration_ms: int | float | None,
+        occurred_at: str, activity_key: str,
+    ) -> bool:
+        """Update a compact projector instead of appending ordinary tool events."""
+        try:
+            stamp = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+            activity_day = stamp.astimezone(LOCAL_TZ).date().isoformat()
+        except (TypeError, ValueError):
+            activity_day = occurred_at[:10]
+        try:
+            duration = max(0, int(duration_ms or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        inserted = self.db.execute(
+            "INSERT OR IGNORE INTO agent_activity_seen(activity_key,occurred_at) VALUES (?,?)",
+            (activity_key, occurred_at),
+        )
+        if inserted.rowcount == 0:
+            self.db.commit()
+            return False
+        self.db.execute(
+            """INSERT INTO agent_activity_rollups
+            (activity_day,source,session_id,project_key,semantic_kind,completed_count,
+             failed_count,total_duration_ms,last_occurred_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(activity_day,source,session_id,project_key,semantic_kind) DO UPDATE SET
+              completed_count=completed_count+excluded.completed_count,
+              failed_count=failed_count+excluded.failed_count,
+              total_duration_ms=total_duration_ms+excluded.total_duration_ms,
+              last_occurred_at=MAX(last_occurred_at,excluded.last_occurred_at)""",
+            (
+                activity_day, source, session_id, project_id or "", semantic_kind,
+                0 if failed else 1, 1 if failed else 0, duration, occurred_at,
+            ),
+        )
+        self.db.commit()
+        return True
+
     def retract(self, event: str, reason: str) -> str:
-        row = self.db.execute("SELECT * FROM events WHERE event_id=?", (event,)).fetchone()
+        row = self._find_event(event)
         if not row:
             raise ValueError(f"unknown event: {event}")
         return self.append(
@@ -178,12 +193,6 @@ class Ledger:
     def events(self, *, project_id: str | None = None, since: str | None = None, until: str | None = None,
                event_types: set[str] | None = None, include_history: bool = False) -> list[sqlite3.Row]:
         clauses, args = ["1=1"], []
-        if not include_history:
-            clauses.extend([
-                "current.event_type NOT IN ('event_retracted','event_superseded')",
-                "NOT EXISTS (SELECT 1 FROM events correction "
-                "WHERE correction.supersedes=current.event_id)",
-            ])
         if project_id:
             clauses.append("project_id=?"); args.append(project_id)
         if since:
@@ -193,10 +202,32 @@ class Ledger:
         if event_types:
             marks = ",".join("?" for _ in event_types)
             clauses.append(f"event_type IN ({marks})"); args.extend(sorted(event_types))
-        return self.db.execute(
-            f"SELECT current.* FROM events current WHERE {' AND '.join(clauses)} "
-            "ORDER BY current.occurred_at, current.ingested_at, current.event_id", args
-        ).fetchall()
+        query = f"SELECT current.* FROM events current WHERE {' AND '.join(clauses)}"
+        hot = self.db.execute(query, args).fetchall()
+        from .cold_store import cold_rows
+
+        cold = cold_rows(self.path, query, args)
+        merged = {str(row["event_id"]): row for row in [*cold, *hot]}
+        if not include_history:
+            superseded = {
+                str(row["supersedes"])
+                for row in [
+                    *cold_rows(self.path, "SELECT supersedes FROM events WHERE supersedes IS NOT NULL"),
+                    *self.db.execute(
+                        "SELECT supersedes FROM events WHERE supersedes IS NOT NULL",
+                    ).fetchall(),
+                ]
+                if row["supersedes"]
+            }
+            merged = {
+                key: row for key, row in merged.items()
+                if row["event_type"] not in {"event_retracted", "event_superseded"}
+                and key not in superseded
+            }
+        return sorted(
+            merged.values(),
+            key=lambda row: (row["occurred_at"], row["ingested_at"], row["event_id"]),
+        )
 
     def correct_project(
         self,
@@ -207,7 +238,7 @@ class Ledger:
         repo_path: str | None = None,
     ) -> str:
         """Append a project-label correction while preserving the original row."""
-        row = self.db.execute("SELECT * FROM events WHERE event_id=?", (event,)).fetchone()
+        row = self._find_event(event)
         if not row:
             raise ValueError(f"unknown event: {event}")
         if row["project_id"] == project_id:
@@ -233,7 +264,33 @@ class Ledger:
         )
 
     def event_evidence(self, event_id_value: str) -> list[sqlite3.Row]:
-        return self.db.execute("SELECT * FROM evidence WHERE event_id=?", (event_id_value,)).fetchall()
+        return self.event_evidence_many([event_id_value]).get(event_id_value, [])
+
+    def event_evidence_many(self, event_ids: Iterable[str]) -> dict[str, list[sqlite3.Row]]:
+        from .cold_store import cold_rows
+
+        identifiers = list(dict.fromkeys(str(value) for value in event_ids))
+        output: dict[str, dict[str, sqlite3.Row]] = {value: {} for value in identifiers}
+        for offset in range(0, len(identifiers), 500):
+            batch = identifiers[offset:offset + 500]
+            if not batch:
+                continue
+            marks = ",".join("?" for _ in batch)
+            query = f"SELECT * FROM evidence WHERE event_id IN ({marks}) ORDER BY evidence_id"
+            hot = self.db.execute(query, batch).fetchall()
+            cold = cold_rows(self.path, query, batch)
+            for row in [*cold, *hot]:
+                output[str(row["event_id"])][str(row["evidence_id"])] = row
+        return {key: list(values.values()) for key, values in output.items()}
+
+    def _find_event(self, event: str) -> sqlite3.Row | None:
+        row = self.db.execute("SELECT * FROM events WHERE event_id=?", (event,)).fetchone()
+        if row is not None:
+            return row
+        from .cold_store import cold_rows
+
+        rows = cold_rows(self.path, "SELECT * FROM events WHERE event_id=?", (event,))
+        return rows[0] if rows else None
 
     def scalar(self, query: str, args: tuple[Any, ...] = ()) -> Any:
         row = self.db.execute(query, args).fetchone()

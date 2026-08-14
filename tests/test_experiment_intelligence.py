@@ -89,7 +89,7 @@ def test_backfill_is_cached_and_api_reads_without_model_calls(tmp_path: Path, mo
     path.write_text(_report(), encoding="utf-8")
     calls: list[str] = []
 
-    def fake_model(model: str, instruction: dict):
+    def fake_model(model: str, instruction: dict, **_kwargs):
         calls.append(model)
         return {"days": [{"date": "2026-08-01", "experiments": [{
             "project_id": "ocr", "title": "OCR 双后端延迟评测", "kind": "benchmark",
@@ -139,7 +139,7 @@ def test_fallback_sidecar_is_retried_by_primary_model(tmp_path: Path, monkeypatc
     path.write_text(_report(), encoding="utf-8")
     attempts: list[str] = []
 
-    def empty_response(model: str, instruction: dict):
+    def empty_response(model: str, instruction: dict, **_kwargs):
         attempts.append(model)
         if model.startswith("codex:") and attempts.count(model) == 1:
             raise RuntimeError("temporary transport error")
@@ -164,7 +164,7 @@ def test_read_only_experiment_api_returns_sidecar_and_rejects_unknown_project(
     reports.mkdir()
     (reports / "2026-08-01.md").write_text(_report(), encoding="utf-8")
     monkeypatch.setenv("RD_DAILY_REPORT_DIR", str(reports))
-    monkeypatch.setattr("rd_cockpit.experiment_intelligence._request_any_model", lambda model, instruction: (
+    monkeypatch.setattr("rd_cockpit.experiment_intelligence._request_any_model", lambda model, instruction, **_kwargs: (
         {"days": [{"date": "2026-08-01", "experiments": []}]}, {"model": model, "provider": "test"},
     ))
     backfill(directory=reports, days=2, target=date(2026, 8, 2), projects=["ocr"])

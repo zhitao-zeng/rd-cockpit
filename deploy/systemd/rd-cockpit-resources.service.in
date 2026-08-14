@@ -1,0 +1,16 @@
+[Unit]
+Description=R&D Cockpit GPU and Docker sampler
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+EnvironmentFile=-%h/.config/rd-cockpit/env
+ExecStart=@PYTHON@ -m rd_cockpit --home @ROOT@ resources --watch --interval 300
+Restart=on-failure
+RestartSec=5
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -92,6 +92,30 @@ def test_only_executed_runner_is_classified_not_incidental_eval_text() -> None:
     assert _classify_command("ssh host 'cat evaluation.log'") is None
 
 
+def test_ordinary_shell_tool_is_not_persisted_as_a_research_event(tmp_path: Path) -> None:
+    home, repo = _home(tmp_path)
+    ledger = Ledger(home / ".rd-cockpit" / "events.sqlite")
+    result = handle_agent_hook(home, ledger, "codex", {
+        "session_id": "read-only-session", "hook_event_name": "PostToolUse",
+        "cwd": str(repo), "tool_name": "Bash", "tool_use_id": "read-1",
+        "tool_input": {"cmd": "git status --short", "workdir": str(repo)},
+        "tool_response": {"stdout": "", "exit_code": 0},
+    })
+    assert result["ignored_reason"] == "non_semantic_tool"
+    assert ledger.events(event_types={"agent_tool_completed", "agent_tool_failed"}) == []
+    assert len(ledger.events(event_types={"agent_session_started"})) == 1
+    rollup = ledger.db.execute("SELECT * FROM agent_activity_rollups").fetchone()
+    assert rollup["completed_count"] == 1
+    handle_agent_hook(home, ledger, "codex", {
+        "session_id": "read-only-session", "hook_event_name": "PostToolUse",
+        "cwd": str(repo), "tool_name": "Bash", "tool_use_id": "read-1",
+        "tool_input": {"cmd": "git status --short", "workdir": str(repo)},
+        "tool_response": {"stdout": "", "exit_code": 0},
+    })
+    assert ledger.scalar("SELECT completed_count FROM agent_activity_rollups") == 1
+    ledger.close()
+
+
 def test_chained_command_output_after_pytest_does_not_pollute_test_metrics(tmp_path: Path) -> None:
     home, repo = _home(tmp_path)
     ledger = Ledger(home / ".rd-cockpit" / "events.sqlite")

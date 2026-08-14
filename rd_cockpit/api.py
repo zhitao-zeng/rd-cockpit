@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+
+try:
+    from starlette.requests import Request
+    from starlette.responses import Response
+except ImportError:  # pragma: no cover - the server extra is optional
+    Request = Response = Any  # type: ignore[misc,assignment]
 
 from .anomalies import find_anomalies
 from .config import load_config
@@ -13,28 +21,141 @@ from .state import build_state, state_dict
 from .sessions import session_views
 
 
-def create_app(home: Path) -> Any:
+def create_app(
+    home: Path, *, safe_mode: bool = False, api_token: str | None = None,
+) -> Any:
     try:
         from fastapi import FastAPI, HTTPException
-        from fastapi.responses import HTMLResponse
+        from fastapi.responses import HTMLResponse, JSONResponse
     except ImportError as exc:  # pragma: no cover - exercised only without the optional server extra
         raise RuntimeError("read-only API requires: pip install -e '.[server]'") from exc
 
-    app = FastAPI(title="R&D Cockpit", version="0.1.0", docs_url="/docs")
+    app = FastAPI(
+        title="R&D Cockpit", version="0.1.0",
+        docs_url=None if safe_mode else "/docs",
+        redoc_url=None if safe_mode else "/redoc",
+        openapi_url=None if safe_mode else "/openapi.json",
+    )
+    configured_token = api_token if api_token is not None else os.environ.get("RD_API_TOKEN", "")
+
+    if safe_mode:
+        from .privacy import safe_value
+
+        @app.middleware("http")
+        async def safe_api_boundary(request: Request, call_next):
+            path = request.url.path
+            root_path = str(request.scope.get("root_path") or "")
+            if root_path and path.startswith(root_path):
+                path = path[len(root_path):] or "/"
+            allowed = path in {"/health", "/auth/status"} or path.startswith("/simple/")
+            if not allowed:
+                return JSONResponse({"detail": "not found"}, status_code=404)
+            authorization = request.headers.get("authorization", "")
+            supplied = authorization[7:] if authorization.casefold().startswith("bearer ") else ""
+            authenticated = not configured_token or secrets.compare_digest(supplied, configured_token)
+            if path != "/auth/status" and not authenticated:
+                return JSONResponse(
+                    {"detail": "authentication required"}, status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            response = await call_next(request)
+            if response.headers.get("X-RD-Privacy-Safe") == "1":
+                response.headers.setdefault("Cache-Control", "private, max-age=30")
+                response.headers.setdefault("X-Content-Type-Options", "nosniff")
+                return response
+            content_type = response.headers.get("content-type", "")
+            if "application/json" not in content_type:
+                return response
+            body = b"".join([chunk async for chunk in response.body_iterator])
+            try:
+                value = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return Response(
+                    body, status_code=response.status_code, headers=dict(response.headers),
+                    media_type=content_type,
+                )
+            sanitized = safe_value(value, cockpit_home=home)
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
+            headers.setdefault("Cache-Control", "private, max-age=30")
+            headers.setdefault("X-Content-Type-Options", "nosniff")
+            return JSONResponse(sanitized, status_code=response.status_code, headers=headers)
 
     def with_ledger(fn):
-        ledger = Ledger(home / ".rd-cockpit" / "events.sqlite")
+        ledger = Ledger(home / ".rd-cockpit" / "events.sqlite", readonly=True)
         try: return fn(ledger)
         finally: ledger.close()
 
+    def deliver_cached(
+        request: Request, response: Response, cached, *, privacy_safe: bool = False,
+    ) -> Any:
+        etag = f'"{cached.etag}"'
+        headers = {
+            "ETag": etag,
+            "Cache-Control": "private, max-age=30, must-revalidate",
+            "X-RD-Cache": "hit" if cached.cache_hit else "miss",
+            "X-RD-Generated-At": cached.generated_at,
+        }
+        if privacy_safe:
+            headers["X-RD-Privacy-Safe"] = "1"
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers=headers)
+        for key, value in headers.items():
+            response.headers[key] = value
+        return cached.data
+
+    def safe_projection(value: dict[str, Any]) -> dict[str, Any]:
+        if not safe_mode:
+            return value
+        from .privacy import safe_value
+
+        sanitized = safe_value(value, cockpit_home=home)
+        return sanitized if isinstance(sanitized, dict) else {}
+
+    def projection_parameters(value: dict[str, Any]) -> dict[str, Any]:
+        return {**value, "privacy": "safe" if safe_mode else "local"}
+
+    def development_core(days: int, target: date):
+        from .development import development_dashboard
+        from .view_cache import get_or_build
+
+        parameters = {"days": days, "target_date": target.isoformat()}
+        return get_or_build(
+            home, "development-core", parameters,
+            lambda: development_dashboard(home, days=days, target=target),
+        )
+
     @app.get("/health")
     def health() -> dict[str, Any]:
+        if safe_mode:
+            return {"ok": True}
         return {"ok": True, "home": str(home), "database": str(home / ".rd-cockpit" / "events.sqlite")}
+
+    @app.get("/auth/status")
+    def auth_status(request: Request) -> dict[str, Any]:
+        authorization = request.headers.get("authorization", "")
+        supplied = authorization[7:] if authorization.casefold().startswith("bearer ") else ""
+        return {
+            "required": bool(configured_token),
+            "authenticated": not configured_token or secrets.compare_digest(supplied, configured_token),
+        }
+
+    @app.get("/simple/projects")
+    def simple_projects() -> dict[str, Any]:
+        config = load_config(home / "config" / "projects.yaml")
+        return {
+            project_id: {
+                "project_id": project_id,
+                "name": str(value.get("name") or project_id),
+                "lifecycle_status": str(value.get("lifecycle_status") or "active"),
+            }
+            for project_id, value in config.get("projects", {}).items()
+        }
 
     @app.get("/projects")
     def projects() -> dict[str, Any]:
         config = load_config(home / "config" / "projects.yaml")
-        ledger = Ledger(home / ".rd-cockpit" / "events.sqlite")
+        ledger = Ledger(home / ".rd-cockpit" / "events.sqlite", readonly=True)
         try:
             return {pid: state_dict(build_state(ledger, home, pid)) for pid in config.get("projects", {})}
         finally:
@@ -183,8 +304,11 @@ def create_app(home: Path) -> Any:
             except ValueError as exc: raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
         from .daily_source import load_report
         from .daily_supplement import load_supplement
-        report = load_report(report_date)
-        report["supplement"] = load_supplement(report["date"]) if report.get("date") else None
+        from .project_identity import canonicalize_report, canonicalize_supplement
+        report = canonicalize_report(load_report(report_date), home)
+        report["supplement"] = canonicalize_supplement(
+            load_supplement(report["date"]) if report.get("date") else None, home,
+        )
         if report["supplement"] and not report["token"]["total_tokens"]:
             report["token"]["total_tokens"] = report["supplement"]["totals"]["tokens"]
         return report
@@ -194,31 +318,68 @@ def create_app(home: Path) -> Any:
         from .daily_source import available_report_dates, report_directories, report_directory
         dates = available_report_dates()
         return {"dates": list(reversed(dates)), "latest": dates[-1] if dates else None,
-                "directory": str(report_directory()),
-                "directories": [str(value) for value in report_directories()]}
+                "directory": "" if safe_mode else str(report_directory()),
+                "directories": [] if safe_mode else [str(value) for value in report_directories()]}
 
     @app.get("/simple/analytics")
-    def simple_analytics(days: int = 30) -> dict[str, Any]:
+    def simple_analytics(request: Request, response: Response, days: int = 30) -> Any:
         from .simple import analytics
-        return with_ledger(lambda ledger: analytics(ledger, home, days=max(1, min(days, 365))))
+        from .view_cache import get_or_build
+        bounded = max(1, min(days, 365))
+
+        def build() -> dict[str, Any]:
+            return with_ledger(lambda ledger: analytics(ledger, home, days=bounded))
+
+        cached = get_or_build(
+            home, "analytics", {"days": bounded}, build, source_scope="analytics",
+        )
+        return deliver_cached(request, response, cached)
 
     @app.get("/simple/knowledge")
     def simple_knowledge(project: str | None = None) -> dict[str, Any]:
         from .simple import knowledge
         return with_ledger(lambda ledger: knowledge(ledger, home, project))
 
+    @app.get("/simple/semantic-feedback")
+    def simple_semantic_feedback(
+        view: str | None = None, project: str | None = None, limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return the latest private rating for each generated semantic item."""
+        from .semantic_feedback import latest_feedback
+        from .project_identity import canonical_project_id
+
+        project_id = canonical_project_id(project, home) if project else None
+        items = with_ledger(lambda ledger: latest_feedback(
+            ledger, view=view, project_id=None if project_id == "unassigned" else project_id,
+            limit=max(1, min(limit, 1000)),
+        ))
+        return {"items": items, "count": len(items)}
+
+    @app.post("/simple/semantic-feedback")
+    def simple_record_semantic_feedback(value: dict[str, Any]) -> dict[str, Any]:
+        """Append user feedback; it is never treated as an observed research fact."""
+        from .semantic_feedback import record_feedback
+
+        ledger = Ledger(home / ".rd-cockpit" / "events.sqlite")
+        try:
+            try:
+                item = record_feedback(home, ledger, value)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            ledger.close()
+        return {"ok": True, "item": item}
+
     @app.get("/simple/research-radar")
-    def simple_research_radar(project: str | None = None, refresh: bool = False) -> dict[str, Any]:
+    def simple_research_radar(project: str | None = None) -> dict[str, Any]:
         """Return recent papers related to configured project research topics.
 
-        Results are cached locally for 24 hours by default. ``refresh`` rebuilds
-        the candidate pool and rotates qualified unseen papers; it only reads
-        external metadata; it never changes a project repository or research
-        conclusion.
+        This endpoint is cache-only: it never performs network or model work.
+        The scheduled ``radar-refresh`` command updates the snapshot.
         """
-        from .research_radar import research_radar
+        from .research_radar import read_research_radar
         try:
-            return research_radar(home, project=project, refresh=refresh)
+            return read_research_radar(home, project=project)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="unknown project") from exc
 
@@ -237,26 +398,191 @@ def create_app(home: Path) -> Any:
         from .project_discovery import read_discovery
         return read_discovery(home)
 
+    @app.get("/simple/task-status")
+    def simple_task_status() -> dict[str, Any]:
+        """Read the last scheduled refresh result; this endpoint starts no work."""
+        from .task_status import read_status
+        return read_status(home)
+
+    @app.get("/simple/model-runs")
+    def simple_model_runs(days: int = 30, limit: int = 100) -> dict[str, Any]:
+        """Return privacy-safe model cost/cache metadata; never prompts or outputs."""
+        from .model_runs import model_run_summary
+        return model_run_summary(home, days=max(1, min(days, 365)), limit=max(1, min(limit, 500)))
+
+    @app.get("/simple/resource-history")
+    def simple_resource_history(days: int = 365, kind: str = "day") -> dict[str, Any]:
+        from .resources import rollup_history
+        if kind not in {"hour", "day"}:
+            raise HTTPException(status_code=400, detail="kind must be hour or day")
+        return with_ledger(lambda ledger: rollup_history(
+            ledger, days=max(1, min(days, 3650)), kind=kind,
+        ))
+
     @app.get("/simple/development")
-    def simple_development(days: int = 90, target_date: str | None = None) -> dict[str, Any]:
+    def simple_development(
+        request: Request, response: Response, days: int = 90, target_date: str | None = None,
+    ) -> Any:
         try:
             target = date.fromisoformat(target_date) if target_date else date.today()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
+        if safe_mode:
+            raise HTTPException(status_code=404, detail="use the compact development endpoints")
         from .development import development_dashboard
-        return development_dashboard(home, days=max(7, min(days, 365)), target=target)
+        from .view_cache import get_or_build
+        bounded = max(7, min(days, 365))
+        parameters = {"days": bounded, "target_date": target.isoformat()}
+        cached = get_or_build(
+            home, "development", parameters,
+            lambda: development_dashboard(home, days=bounded, target=target),
+        )
+        return deliver_cached(request, response, cached)
+
+    @app.get("/simple/development-summary")
+    def simple_development_summary(
+        request: Request, response: Response, days: int = 90, target_date: str | None = None,
+    ) -> Any:
+        try:
+            target = date.fromisoformat(target_date) if target_date else date.today()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
+        from .development import development_summary_view
+        from .view_cache import get_or_build
+        bounded = max(7, min(days, 365))
+        parameters = {"days": bounded, "target_date": target.isoformat()}
+        core = development_core(bounded, target)
+        cached = get_or_build(
+            home, "development-summary", projection_parameters(parameters),
+            lambda: safe_projection(development_summary_view(core.data)),
+        )
+        return deliver_cached(request, response, cached, privacy_safe=safe_mode)
+
+    @app.get("/simple/development-project/{project_id}")
+    def simple_development_project(
+        project_id: str, request: Request, response: Response, days: int = 90,
+        target_date: str | None = None, timeline_limit: int = 120,
+    ) -> Any:
+        try:
+            target = date.fromisoformat(target_date) if target_date else date.today()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
+        config = load_config(home / "config" / "projects.yaml")
+        bounded = max(7, min(days, 365))
+        core = development_core(bounded, target)
+        known = set(config.get("projects", {})) | set((core.data.get("storylines") or {}).keys())
+        if project_id not in known:
+            raise HTTPException(status_code=404, detail="unknown project")
+        from .development import development_project_view
+        from .view_cache import get_or_build
+        limit = max(12, min(timeline_limit, 500))
+        parameters = {
+            "days": bounded, "target_date": target.isoformat(),
+            "project_id": project_id, "timeline_limit": limit,
+        }
+        cached = get_or_build(
+            home, "development-project", projection_parameters(parameters),
+            lambda: safe_projection(development_project_view(
+                core.data, project_id, timeline_limit=limit,
+            )),
+        )
+        return deliver_cached(request, response, cached, privacy_safe=safe_mode)
+
+    @app.get("/simple/development-global")
+    def simple_development_global(
+        request: Request, response: Response, days: int = 90, target_date: str | None = None,
+    ) -> Any:
+        try:
+            target = date.fromisoformat(target_date) if target_date else date.today()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
+        from .development import development_global_view
+        from .view_cache import get_or_build
+        bounded = max(7, min(days, 365))
+        parameters = {"days": bounded, "target_date": target.isoformat()}
+        core = development_core(bounded, target)
+        cached = get_or_build(
+            home, "development-global", projection_parameters(parameters),
+            lambda: safe_projection(development_global_view(core.data)),
+        )
+        return deliver_cached(request, response, cached, privacy_safe=safe_mode)
+
+    @app.get("/simple/development-timeline")
+    def simple_development_timeline(
+        request: Request, response: Response, days: int = 90, project: str | None = None,
+        target_date: str | None = None, offset: int = 0, limit: int = 50,
+    ) -> Any:
+        try:
+            target = date.fromisoformat(target_date) if target_date else date.today()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
+        from .development import development_timeline_view
+        from .view_cache import get_or_build
+        bounded = max(7, min(days, 365))
+        start, size = max(0, offset), max(1, min(limit, 200))
+        core = development_core(bounded, target)
+        if project and project not in (core.data.get("storylines") or {}):
+            raise HTTPException(status_code=404, detail="unknown project")
+        parameters = {
+            "days": bounded, "target_date": target.isoformat(), "project": project,
+            "offset": start, "limit": size,
+        }
+        cached = get_or_build(
+            home, "development-timeline", projection_parameters(parameters),
+            lambda: safe_projection(development_timeline_view(
+                core.data, project_id=project, offset=start, limit=size,
+            )),
+        )
+        return deliver_cached(request, response, cached, privacy_safe=safe_mode)
+
+    @app.get("/simple/development-history")
+    def simple_development_history(
+        request: Request, response: Response, days: int = 90,
+        target_date: str | None = None, offset: int = 0, limit: int = 10,
+    ) -> Any:
+        try:
+            target = date.fromisoformat(target_date) if target_date else date.today()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
+        from .development import development_history_view
+        from .view_cache import get_or_build
+        bounded = max(7, min(days, 365))
+        start, size = max(0, offset), max(1, min(limit, 31))
+        core = development_core(bounded, target)
+        parameters = {
+            "days": bounded, "target_date": target.isoformat(),
+            "offset": start, "limit": size,
+        }
+        cached = get_or_build(
+            home, "development-history", projection_parameters(parameters),
+            lambda: safe_projection(development_history_view(
+                core.data, offset=start, limit=size,
+            )),
+        )
+        return deliver_cached(request, response, cached, privacy_safe=safe_mode)
 
     @app.get("/simple/intelligence")
-    def simple_intelligence(days: int = 90, baseline: str | None = None,
-                            target_date: str | None = None) -> dict[str, Any]:
+    def simple_intelligence(
+        request: Request, response: Response, days: int = 90, baseline: str | None = None,
+        target_date: str | None = None,
+    ) -> Any:
         try:
             target = date.fromisoformat(target_date) if target_date else date.today()
             baseline_date = date.fromisoformat(baseline) if baseline else None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="dates must be YYYY-MM-DD") from exc
         from .intelligence import project_intelligence
-        return project_intelligence(home, days=max(7, min(days, 365)),
-                                    baseline=baseline_date, target=target)
+        from .view_cache import get_or_build
+        bounded = max(7, min(days, 365))
+        parameters = {
+            "days": bounded, "target_date": target.isoformat(),
+            "baseline": baseline_date.isoformat() if baseline_date else None,
+        }
+        cached = get_or_build(
+            home, "intelligence", parameters,
+            lambda: project_intelligence(home, days=bounded, baseline=baseline_date, target=target),
+        )
+        return deliver_cached(request, response, cached)
 
     @app.get("/simple/algorithm-architecture")
     def simple_algorithm_architecture() -> dict[str, Any]:

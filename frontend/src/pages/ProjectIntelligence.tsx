@@ -1,20 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Chart } from "../components/Chart";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { Chart } from "../components/ScatterChart";
 import { Card, EmptyState, PageHeader, QueryBoundary } from "../components/ui";
-import { getProjectIntelligence } from "../lib/api";
+import { getProjectIntelligence, getSemanticFeedback, recordSemanticFeedback } from "../lib/api";
 import { fmtTokens } from "../lib/format";
 import type {
   IntelligenceDeltaItem,
   IntelligencePulse,
   ProjectIntelligenceResponse,
+  SemanticFeedbackRating,
 } from "../lib/types";
 import { axisBase, baseChartOption, C, tooltipBase } from "../lib/chartTheme";
 
 const LAST_SEEN_KEY = "rd-cockpit.intelligence.last-seen-report";
 const MODE_LABEL: Record<string, string> = {
   audited: "日报审计", historical_audited: "历史已审计",
-  historical_fallback: "历史回退", empty: "无数据",
+  historical_fallback: "历史回退", stale_last_good: "上次可信版本", empty: "无数据",
 };
 const PRIORITY_LABEL: Record<string, string> = { high: "高", medium: "中", low: "低" };
 const PRIORITY_COLOR: Record<string, string> = { high: C.critical, medium: C.warning, low: C.primary };
@@ -39,6 +40,61 @@ function compact(value: string | null | undefined, limit = 145): string {
 function SourceTag({ mode }: { mode: string }) {
   const trusted = mode === "audited" || mode === "historical_audited";
   return <span className={`rounded-full border px-2 py-0.5 text-[10px] ${trusted ? "border-passed/30 text-passed" : "border-warning/30 text-warning"}`}>{MODE_LABEL[mode] ?? mode}</span>;
+}
+
+const FEEDBACK_LABEL: Record<SemanticFeedbackRating, string> = {
+  accurate: "准确", noise: "没意义", incorrect: "内容错误",
+  wrong_project: "项目错误", missing: "有遗漏",
+};
+
+function StorylineFeedback({ projectId, text, evidence, sourceDates, projects }: {
+  projectId: string; text: string; evidence: string[]; sourceDates: string[]; projects: IntelligencePulse[];
+}) {
+  const itemId = `storyline:${projectId}`;
+  const dates = [...new Set([...sourceDates, ...evidence.map((value) => value.match(/(?:report:)?(\d{4}-\d{2}-\d{2})/)?.[1])]
+    .filter((value): value is string => Boolean(value)))];
+  const [comment, setComment] = useState("");
+  const [correctedProject, setCorrectedProject] = useState("");
+  const feedback = useQuery({
+    queryKey: ["semantic-feedback", "storyline", projectId],
+    queryFn: () => getSemanticFeedback("storyline", projectId), staleTime: 30_000,
+  });
+  const current = feedback.data?.items.find((item) => item.item_id === itemId);
+  const mutation = useMutation({
+    mutationFn: (rating: SemanticFeedbackRating) => recordSemanticFeedback({
+      view: "storyline", item_id: itemId, project_id: projectId, rating, text,
+      source_dates: dates, comment: comment.trim() || undefined,
+      corrected_project_id: rating === "wrong_project" ? correctedProject : undefined,
+    }),
+    onSuccess: () => { setComment(""); void feedback.refetch(); },
+  });
+  return (
+    <details className="mt-5 rounded-lg border border-line bg-page/25 px-3 py-3">
+      <summary className="cursor-pointer text-xs text-ink3">这段总结对吗？{current ? ` · 已标记“${FEEDBACK_LABEL[current.rating]}”` : ""}</summary>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {(["accurate", "noise", "incorrect", "missing"] as SemanticFeedbackRating[]).map((rating) => (
+          <button key={rating} disabled={mutation.isPending} onClick={() => mutation.mutate(rating)}
+            className={`rounded border px-2.5 py-1 text-xs ${current?.rating === rating ? "border-primary bg-primary/10 text-primary" : "border-line text-ink2"}`}>
+            {FEEDBACK_LABEL[rating]}
+          </button>
+        ))}
+      </div>
+      <textarea value={comment} onChange={(event) => setComment(event.target.value)} rows={2}
+        placeholder="可选：指出具体哪句不对或漏了什么。反馈只用于下一次离线审计。"
+        className="mt-3 w-full rounded-md border border-line bg-card px-3 py-2 text-xs text-ink outline-none focus:border-primary" />
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <select value={correctedProject} onChange={(event) => setCorrectedProject(event.target.value)}
+          className="rounded border border-line bg-card px-2 py-1 text-xs text-ink2">
+          <option value="">如归错项目，选择正确项目</option>
+          {projects.filter((item) => item.project_id !== projectId).map((item) => <option key={item.project_id} value={item.project_id}>{item.name}</option>)}
+        </select>
+        <button disabled={!correctedProject || mutation.isPending} onClick={() => mutation.mutate("wrong_project")}
+          className="rounded border border-warning/40 px-2.5 py-1 text-xs text-warning disabled:opacity-40">项目错误</button>
+        {mutation.isError && <span className="text-xs text-critical">保存失败，请稍后重试</span>}
+        {mutation.isSuccess && <span className="text-xs text-passed">已保存，下次审计会只重算相关日报</span>}
+      </div>
+    </details>
+  );
 }
 
 function PulseCard({ pulse, selected, onClick }: { pulse: IntelligencePulse; selected: boolean; onClick: () => void }) {
@@ -161,6 +217,9 @@ function IntelligenceContent({ data, project, setProject, baseline, setBaseline 
             <div className="rounded-lg border border-critical/20 bg-critical/5 px-3 py-3"><div className="text-[10px] text-critical">当前阻塞</div><p className="mt-1 text-xs leading-5 text-ink2">{pulse.current_blocker ?? "最新相关日报没有明确阻塞"}</p></div>
             <div className="rounded-lg border border-warning/20 bg-warning/5 px-3 py-3"><div className="text-[10px] text-warning">下一证据</div><p className="mt-1 text-xs leading-5 text-ink2">{pulse.next_action ?? detail.unknowns[0]?.missing_evidence ?? "最新相关日报没有明确下一步"}</p></div>
           </div>
+          <StorylineFeedback projectId={active} text={detail.storyline.summary}
+            evidence={detail.storyline.evidence} sourceDates={detail.storyline.source_dates ?? []}
+            projects={data.pulses} />
         </Card>
       </div>
 
@@ -188,6 +247,7 @@ export function ProjectIntelligence() {
       {query.data?.audit_coverage && <div className="rounded-lg border border-line bg-card px-4 py-3 text-xs text-ink2">
         审计覆盖：<b className="text-ink">{query.data.audit_coverage.audited_count}/{query.data.audit_coverage.report_count}</b> 份日报
         {query.data.audit_coverage.fallback_count > 0 && <span className="ml-2 text-warning">· {query.data.audit_coverage.fallback_count} 份仍为保守回退</span>}
+        {query.data.audit_coverage.stale_last_good_count > 0 && <span className="ml-2 text-warning">· {query.data.audit_coverage.stale_last_good_count} 份保留上次可信版本</span>}
         {query.data.audit_coverage.last_audited_date && <span className="ml-2 text-ink3">· 最近审计 {query.data.audit_coverage.last_audited_date}</span>}
       </div>}
       <QueryBoundary query={query} isEmpty={(data) => data.pulses.length === 0} emptyText="这段时间还没有可生成情报的正式日报">

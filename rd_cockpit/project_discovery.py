@@ -13,16 +13,17 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .agent_usage import _claude_session, _codex_session, _git_toplevel, _recent_files
+from .artifact_cache import atomic_write_json
 from .config import PROJECT_ID, add_project, load_config
+from .model_runner import run_codex_json
 from .security import redact_text, redact_value
-from .runtime import executable as resolve_executable, workspace_roots
+from .runtime import workspace_roots
 
 
 SCHEMA_VERSION = 1
@@ -57,11 +58,7 @@ def _load_cache(home: Path) -> dict[str, Any]:
 
 
 def _save_cache(home: Path, value: dict[str, Any]) -> None:
-    path = _cache_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    atomic_write_json(_cache_path(home), value)
 
 
 def _candidate_id(repo: str) -> str:
@@ -286,43 +283,29 @@ def _json_object(text: str) -> dict[str, Any]:
     return parsed
 
 
-def _request_codex(model_spec: str, instruction: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    model_and_effort = model_spec.removeprefix("codex:")
-    model, separator, effort = model_and_effort.partition("@")
-    if not separator:
-        effort = "medium"
-    executable = resolve_executable("RD_PROJECT_DISCOVERY_CODEX_BIN", "codex")
-    timeout = float(os.environ.get("RD_PROJECT_DISCOVERY_CODEX_TIMEOUT", "240"))
-    with tempfile.TemporaryDirectory(prefix="rd-project-discovery-") as temporary:
-        output_path = Path(temporary) / "review.json"
-        command = [
-            executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--skip-git-repo-check", "--sandbox", "read-only", "--model", model,
-            "-c", 'model_provider="openai"', "-c", f'model_reasoning_effort="{effort}"',
-            "-C", str(Path(__file__).resolve().parents[1]), "--json",
-            "--output-last-message", str(output_path),
-            "审查标准输入中的项目候选。严格按 output_schema 返回纯 JSON。",
-        ]
-        completed = subprocess.run(
-            command, input=json.dumps(instruction, ensure_ascii=False), capture_output=True,
-            text=True, timeout=timeout, check=False,
-        )
-        if completed.returncode:
-            detail = completed.stderr.strip().splitlines()
-            raise RuntimeError(f"Codex exited with {completed.returncode}: {(detail[-1] if detail else '')[:300]}")
-        parsed = _json_object(output_path.read_text(encoding="utf-8", errors="replace"))
-        usage: dict[str, Any] = {}
-        for line in completed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-                usage = event["usage"]
+def _request_codex(
+    model_spec: str, instruction: dict[str, Any], *, home: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    parsed, metadata = run_codex_json(
+        model_spec, instruction,
+        prompt="审查标准输入中的项目候选。严格按 output_schema 返回纯 JSON。",
+        executable_env="RD_PROJECT_DISCOVERY_CODEX_BIN",
+        timeout_env="RD_PROJECT_DISCOVERY_CODEX_TIMEOUT", default_timeout=240,
+        workdir=Path(__file__).resolve().parents[1], temp_prefix="rd-project-discovery-",
+        run_context={
+            "home": home or os.environ.get("RD_COCKPIT_HOME"), "stage": "discovery",
+            "source_hash": hashlib.sha256(
+                json.dumps(instruction, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "reason": "发现了新的或证据发生变化的项目候选。",
+        },
+    )
     reviews = parsed.get("reviews")
     if not isinstance(reviews, list):
         raise ValueError("Codex output is missing reviews")
-    return reviews, {**usage, "model": model_spec, "provider": "codex-cli", "reasoning_effort": effort}
+    return reviews, {**metadata.get("usage", {}), "model": model_spec,
+                     "provider": metadata["provider"],
+                     "reasoning_effort": metadata["reasoning_effort"]}
 
 
 def _validate_reviews(raw: list[dict[str, Any]], candidates: list[dict[str, Any]],
@@ -396,7 +379,9 @@ def refresh_discovery(home: Path, *, days: int = 30, force: bool = False,
     error = ""
     if pending:
         try:
-            request = reviewer or (lambda selected_model, payload: _request_codex(selected_model, payload))
+            request = reviewer or (
+                lambda selected_model, payload: _request_codex(selected_model, payload, home=home)
+            )
             known_groups = [] if force else _known_candidate_groups(cache)
             for offset in range(0, len(pending), MAX_CANDIDATES_PER_REVIEW):
                 batch = pending[offset:offset + MAX_CANDIDATES_PER_REVIEW]

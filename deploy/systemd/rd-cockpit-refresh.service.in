@@ -1,0 +1,11 @@
+[Unit]
+Description=R&D Cockpit cached Daily Report intelligence refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ROOT@
+EnvironmentFile=-%h/.config/rd-cockpit/env
+ExecStart=@ROOT@/hooks/normalize-daily-reports.sh
+TimeoutStartSec=3h

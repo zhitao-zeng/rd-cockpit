@@ -4,6 +4,10 @@ projects:
     repo_path: /absolute/path/to/your/repository
     priority: P1
     lifecycle_status: active
+    # Optional historical labels are mapped into this registered project in
+    # user-facing views without rewriting old reports.
+    legacy_project_ids:
+      - old_speech_bucket
     match_keywords:
       - speech recognition
       - ASR
@@ -15,3 +19,8 @@ projects:
 
 machine: local
 machines: {}
+
+# Top-level aliases are useful when one retired label maps to a current
+# project. Targets must exist under `projects`.
+project_aliases:
+  legacy_asr: speech_research

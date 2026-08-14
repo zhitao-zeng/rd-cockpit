@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 
 from rd_cockpit.daily_source import parse_report
-from rd_cockpit.historical_reports import load_normalized, normalize_report
+from rd_cockpit.historical_reports import (
+    PROMPT_VERSION, SCHEMA_VERSION, load_normalized, normalize_report,
+)
 
 
 LEGACY_REPORT = """# 2026-06-01 工作记录
@@ -90,6 +92,28 @@ def test_normalization_cache_and_source_hash_invalidation(tmp_path: Path) -> Non
     assert load_normalized(path) is None
     report = parse_report(path)
     assert "normalization" not in report
+
+
+def test_legacy_codex_sidecar_is_revalidated_without_another_model_call(tmp_path: Path) -> None:
+    path = tmp_path / "2026-06-01.md"
+    path.write_text(LEGACY_REPORT, encoding="utf-8")
+    normalize_report(path, requester=lambda *_: (_candidate(), {"usage": {}}))
+    sidecar_path = tmp_path / "data" / "normalized" / "2026-06-01.json"
+    legacy = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    legacy["schema_version"] = 1
+    legacy.pop("prompt_version", None)
+    legacy.pop("policy_fingerprint", None)
+    sidecar_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    def should_not_run(*_):
+        raise AssertionError("a valid legacy cache should be revalidated locally")
+
+    result = normalize_report(path, requester=should_not_run)
+    upgraded = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert result["status"] == "cached"
+    assert upgraded["schema_version"] == SCHEMA_VERSION
+    assert upgraded["prompt_version"] == PROMPT_VERSION
+    assert upgraded["cache_migration"]["model_call"] is False
 
 
 def test_current_evidence_report_skips_legacy_model_and_sidecar(tmp_path: Path) -> None:

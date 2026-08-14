@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { ECElementEvent, EChartsOption } from "echarts";
-import { Chart } from "../components/Chart";
+import type { EChartsOption } from "echarts";
+import type { ECElementEvent } from "echarts/core";
+import { Chart } from "../components/GraphChart";
 import { ResearchBriefView } from "../components/ResearchBriefView";
 import { Card, EmptyState, PageHeader, QueryBoundary, StatCard } from "../components/ui";
 import { getAlgorithmArchitecture, getAlgorithmArchitectureIndex } from "../lib/api";

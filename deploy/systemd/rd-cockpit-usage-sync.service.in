@@ -1,0 +1,15 @@
+[Unit]
+Description=R&D Cockpit incremental Agent usage and hook queue sync
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+EnvironmentFile=-%h/.config/rd-cockpit/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@PYTHON@ -m rd_cockpit --home @ROOT@ usage-sync --watch --interval 300
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

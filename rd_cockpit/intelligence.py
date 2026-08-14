@@ -18,6 +18,7 @@ from typing import Any
 
 from .daily_source import _project_ids, iter_reports
 from .development import development_dashboard
+from .project_identity import canonical_project_ids, canonicalize_report
 
 IntelligenceByProject = dict[str, list[dict[str, Any]]]
 
@@ -57,12 +58,44 @@ def _intelligence_for(report: dict[str, Any]) -> tuple[dict[str, Any] | None, st
     source_path = Path(source)
     calibrated = _read_json(source_path.parent / "data" / f"{day}_intelligence_validated.json")
     if calibrated:
+        from .intelligence_backfill import (
+            DEFAULT_FALLBACK, DEFAULT_MODEL, PROMPT_VERSION, SCHEMA_VERSION,
+            attribution_fingerprint,
+        )
+        from .project_identity import registered_project_names
+        from .semantic_policy import catalog_fingerprint, policy_fingerprint
         try:
             digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
         except OSError:
             digest = ""
-        if digest and calibrated.get("source_sha256") == digest:
+        expected_policy = policy_fingerprint(
+            "project-intelligence-backfill",
+            schema_version=SCHEMA_VERSION,
+            prompt_version=PROMPT_VERSION,
+            models=(DEFAULT_MODEL, DEFAULT_FALLBACK),
+            extra={"catalog": catalog_fingerprint(registered_project_names())},
+        )
+        compatible = (
+            calibrated.get("schema_version") == SCHEMA_VERSION
+            and calibrated.get("prompt_version") == PROMPT_VERSION
+            and calibrated.get("policy_fingerprint") == expected_policy
+        )
+        attribution_matches = (
+            calibrated.get("attribution_fingerprint") == attribution_fingerprint(report)
+        )
+        if (digest and calibrated.get("source_sha256") == digest and compatible
+                and attribution_matches):
             return calibrated, "historical_audited"
+        # A failed quality gate must not replace a previously accepted semantic
+        # snapshot with a worse one.  Keep the old answer visible, explicitly
+        # labelled stale, only when the latest backfill status cites this date.
+        status = _read_json(source_path.parent / "data" / "intelligence_backfill_status.json")
+        failed_dates = {
+            str(item.get("date")) for item in (status or {}).get("failed", [])
+            if isinstance(item, dict)
+        }
+        if compatible and str(day) in failed_dates:
+            return {**calibrated, "stale_reason": "latest semantic audit failed quality gate"}, "stale_last_good"
     audit = _audit_for(report)
     return (audit, "audited") if audit else (None, "missing")
 
@@ -106,7 +139,7 @@ def _report_projects(report: dict[str, Any]) -> list[str]:
 
 def _item_projects(item: dict[str, Any], report: dict[str, Any], valid: set[str]) -> list[str]:
     raw = [*_strings(item.get("project_ids")), *_strings(item.get("project")), *_strings(item.get("project_id"))]
-    explicit = list(dict.fromkeys(value for value in raw if value in valid))
+    explicit = [value for value in canonical_project_ids(raw, default_unassigned=False) if value in valid]
     # Calibrated intelligence is deliberately single-project.  Never fan one
     # model sentence out into multiple storylines.
     if len(explicit) == 1:
@@ -118,8 +151,10 @@ def _item_projects(item: dict[str, Any], report: dict[str, Any], valid: set[str]
         str(item.get("question") or ""), str(item.get("summary") or ""),
         str(item.get("title") or ""), str(item.get("change") or ""),
     ])
-    projects = [value for value in raw if value in valid]
-    projects.extend(value for value in _project_ids(text) if value in valid)
+    projects = [value for value in canonical_project_ids(raw, default_unassigned=False) if value in valid]
+    projects.extend(value for value in canonical_project_ids(
+        _project_ids(text), default_unassigned=False,
+    ) if value in valid)
     evidence = set(_strings(item.get("evidence")))
     if evidence:
         for group in report.get("groups") or []:
@@ -140,7 +175,7 @@ def _latest_project_report(reports: list[dict[str, Any]], project_id: str) -> di
 
 
 def _text_belongs(text: str, project_id: str, report_projects: list[str]) -> bool:
-    ids = _project_ids(text)
+    ids = canonical_project_ids(_project_ids(text), default_unassigned=False)
     if project_id in ids:
         return True
     if ids == ["asr_other"] and project_id.startswith("asr") and project_id in report_projects:
@@ -151,19 +186,20 @@ def _text_belongs(text: str, project_id: str, report_projects: list[str]) -> boo
 def _structured_intelligence(
     reports: list[dict[str, Any]], valid: set[str],
 ) -> tuple[IntelligenceByProject, IntelligenceByProject, IntelligenceByProject, IntelligenceByProject,
-           set[str], set[str]]:
+           set[str], set[str], set[str]]:
     unknown_updates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     blocker_updates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     breakthroughs: dict[str, list[dict[str, Any]]] = defaultdict(list)
     updates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     audited_dates: set[str] = set()
+    stale_dates: set[str] = set()
     audited_projects: set[str] = set()
     for report in reports:
         audit, source_mode = _intelligence_for(report)
         if not audit:
             continue
         day = str(report["date"])
-        audited_dates.add(day)
+        (stale_dates if source_mode == "stale_last_good" else audited_dates).add(day)
         audited_projects.update(project_id for project_id in _report_projects(report) if project_id in valid)
         for field, destination in (("unknown_updates", unknown_updates),
                                    ("blocker_updates", blocker_updates)):
@@ -173,22 +209,26 @@ def _structured_intelligence(
                 projects = _item_projects(item, report, valid)
                 if len(projects) == 1:
                     destination[projects[0]].append({**item, "project_id": projects[0], "date": day,
-                                                     "source_mode": item.get("source_mode") or source_mode})
+                                                     "source_mode": (source_mode if source_mode == "stale_last_good"
+                                                                     else item.get("source_mode") or source_mode)})
         for item in audit.get("breakthroughs") or []:
             if not isinstance(item, dict):
                 continue
             projects = _item_projects(item, report, valid)
             if len(projects) == 1:
                 breakthroughs[projects[0]].append({**item, "project_id": projects[0], "date": day,
-                                                   "source_mode": item.get("source_mode") or source_mode})
+                                                   "source_mode": (source_mode if source_mode == "stale_last_good"
+                                                                   else item.get("source_mode") or source_mode)})
         for item in audit.get("project_updates") or []:
             if not isinstance(item, dict):
                 continue
             projects = _item_projects(item, report, valid)
             if len(projects) == 1:
                 updates[projects[0]].append({**item, "project_id": projects[0], "date": day,
-                                             "source_mode": item.get("source_mode") or source_mode})
-    return unknown_updates, blocker_updates, breakthroughs, updates, audited_dates, audited_projects
+                                             "source_mode": (source_mode if source_mode == "stale_last_good"
+                                                             else item.get("source_mode") or source_mode)})
+    return (unknown_updates, blocker_updates, breakthroughs, updates,
+            audited_dates, stale_dates, audited_projects)
 
 
 def _replay_unknowns(project_id: str, updates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -226,7 +266,7 @@ def _replay_unknowns(project_id: str, updates: list[dict[str, Any]]) -> tuple[li
             "last_seen": update["date"],
             "evidence": list(dict.fromkeys([*previous.get("evidence", []), *_strings(update.get("evidence"))])),
             "confidence": str(update.get("confidence") or "reported"),
-            "source_mode": "audited",
+            "source_mode": update.get("source_mode") or "audited",
         }
     priority = {"high": 0, "medium": 1, "low": 2}
     recent_first = sorted(active.values(), key=lambda item: str(item["last_seen"]), reverse=True)
@@ -316,8 +356,11 @@ def _storyline(project_id: str, nodes: list[dict[str, Any]], breakthroughs: list
         selected = summaries[-4:]
         text = "".join(item["text"].rstrip("。") + "。" for item in selected if item["text"])
         modes = {str(item.get("source_mode") or "audited") for item in selected}
-        mode = "historical_audited" if modes == {"historical_audited"} else "audited"
+        mode = ("stale_last_good" if "stale_last_good" in modes else
+                "historical_audited" if modes == {"historical_audited"} else "audited")
         evidence = list(dict.fromkeys(ref for item in selected for ref in _strings(item.get("evidence"))))
+        source_dates = list(dict.fromkeys(str(item.get("date") or "") for item in selected
+                                         if str(item.get("date") or "")))
     elif nodes:
         first = nodes[0]
         latest = nodes[-1]
@@ -334,9 +377,12 @@ def _storyline(project_id: str, nodes: list[dict[str, Any]], breakthroughs: list
         text = "。".join(part.rstrip("。") for part in parts) + "。"
         mode = "historical_fallback"
         evidence = list(dict.fromkeys([first["source"], latest["source"], *[item["date"] for item in breakthroughs[-2:]]]))
+        source_dates = list(dict.fromkeys([first["date"], latest["date"],
+                                          *[item["date"] for item in breakthroughs[-2:]]]))
     else:
-        text, mode, evidence = "暂无足够日报记录生成项目故事。", "empty", []
-    return {"project_id": project_id, "summary": text, "source_mode": mode, "evidence": evidence}
+        text, mode, evidence, source_dates = "暂无足够日报记录生成项目故事。", "empty", [], []
+    return {"project_id": project_id, "summary": text, "source_mode": mode,
+            "evidence": evidence, "source_dates": source_dates}
 
 
 def _delta(reports: list[dict[str, Any]], nodes: list[dict[str, Any]], project_id: str,
@@ -383,12 +429,15 @@ def _delta(reports: list[dict[str, Any]], nodes: list[dict[str, Any]], project_i
 
 
 def project_intelligence(home: Path, *, days: int = 90, baseline: date | None = None,
-                         target: date | None = None) -> dict[str, Any]:
+                         target: date | None = None,
+                         dashboard: dict[str, Any] | None = None) -> dict[str, Any]:
     target = target or date.today()
     days = max(7, min(days, 365))
     since = (target - timedelta(days=days - 1)).isoformat()
-    reports = [item for item in iter_reports(since=since) if item.get("date") and item["date"] <= target.isoformat()]
-    dashboard = development_dashboard(home, days=days, target=target)
+    reports = [canonicalize_report(item, home)
+               for item in iter_reports(since=since, cache_home=home)
+               if item.get("date") and item["date"] <= target.isoformat()]
+    dashboard = dashboard or development_dashboard(home, days=days, target=target)
     dates = [item["date"] for item in reports]
     latest = dates[-1] if dates else None
     if baseline and latest and baseline.isoformat() <= latest:
@@ -399,7 +448,7 @@ def project_intelligence(home: Path, *, days: int = 90, baseline: date | None = 
         baseline_date = latest
     valid = {item["project_id"] for item in dashboard.get("lifecycles", []) if item["project_id"] != "unassigned"}
     (structured_unknowns, structured_blockers, structured_breakthroughs,
-     structured_updates, audited_dates, audited_projects) = _structured_intelligence(reports, valid)
+     structured_updates, audited_dates, stale_dates, audited_projects) = _structured_intelligence(reports, valid)
 
     unknowns_by_project: dict[str, list[dict[str, Any]]] = {}
     stale_unknown_counts: dict[str, int] = {}
@@ -523,12 +572,23 @@ def project_intelligence(home: Path, *, days: int = 90, baseline: date | None = 
     pulses.sort(key=lambda item: (item["last_meaningful"], item["result_items"]), reverse=True)
 
     quality = []
+    unmapped = sorted({
+        value for report in reports for value in report.get("unmapped_project_ids", [])
+    })
+    if unmapped:
+        quality.append(
+            f"{len(unmapped)} 个历史项目标签尚未登记，已合并到“未登记历史记录”，不会冒充独立项目。"
+        )
     fallback_projects = [item["project_id"] for item in pulses if item["source_mode"] == "historical_fallback"]
     if fallback_projects:
         quality.append(f"{len(fallback_projects)} 个项目尚无新版情报字段，使用历史日报保守回退。")
+    if stale_dates:
+        quality.append(
+            f"{len(stale_dates)} 份日报的最新语义审计未通过质量闸门，当前保留上一次可信版本并明确标记。"
+        )
     if any(item["tokens"] == 0 for item in effort_progress):
         quality.append("部分项目没有可可靠归属的 Agent Token；未补零以外的估算值。")
-    fallback_dates = [value for value in dates if value not in audited_dates]
+    fallback_dates = [value for value in dates if value not in audited_dates | stale_dates]
     status = _read_json(Path(reports[-1]["source_path"]).parent / "data" /
                         "intelligence_backfill_status.json") if reports else None
     failed_dates = [
@@ -539,6 +599,7 @@ def project_intelligence(home: Path, *, days: int = 90, baseline: date | None = 
             "baseline_date": baseline_date, "available_dates": list(reversed(dates)),
             "pulses": pulses, "effort_progress": effort_progress, "project_details": details,
             "audit_coverage": {"report_count": len(dates), "audited_count": len(audited_dates),
+                               "stale_last_good_count": len(stale_dates),
                                "fallback_count": len(fallback_dates), "failed_dates": failed_dates,
                                "last_audited_date": max(audited_dates) if audited_dates else None},
             "data_quality": quality,

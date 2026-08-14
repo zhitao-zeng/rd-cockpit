@@ -547,6 +547,13 @@ def parse_report(path: Path, *, apply_project_cache: bool = True) -> dict[str, A
     return _reclassify_report(report, path, apply_project_cache=apply_project_cache)
 
 
-def iter_reports(directory: Path | None = None, *, since: str | None = None) -> list[dict[str, Any]]:
+def iter_reports(
+    directory: Path | None = None, *, since: str | None = None,
+    cache_home: Path | None = None,
+) -> list[dict[str, Any]]:
+    if cache_home is not None:
+        from .report_facts import load_report_facts
+
+        return load_report_facts(cache_home, directory=directory, since=since)
     dates = [value for value in available_report_dates(directory) if since is None or value >= since]
     return [load_report(value, directory) for value in dates]

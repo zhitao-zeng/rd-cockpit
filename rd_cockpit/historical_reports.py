@@ -16,19 +16,18 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-from .runtime import daily_report_directory, executable as resolve_executable
+from .artifact_cache import atomic_write_json, sha256_path
+from .model_runner import run_claude_json, run_codex_json
+from .runtime import daily_report_directory
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+PROMPT_VERSION = 2
 DEFAULT_REPORT_DIR = daily_report_directory()
 DEFAULT_TIMEOUT = 240.0
 MODEL_PRIMARY = "codex:gpt-5.6-sol@medium"
@@ -37,12 +36,22 @@ MODEL_FALLBACK = "deepseek-local"
 ModelRequester = Callable[[str, str, list[str]], tuple[dict[str, Any], dict[str, Any]]]
 
 
+def _model_policy() -> tuple[str, str, str]:
+    from .semantic_policy import policy_fingerprint
+
+    primary = os.environ.get("RD_REPORT_NORMALIZE_MODEL", MODEL_PRIMARY).strip()
+    fallback = os.environ.get("RD_REPORT_NORMALIZE_FALLBACK_MODEL", MODEL_FALLBACK).strip()
+    fingerprint = policy_fingerprint(
+        "historical-report-normalization",
+        schema_version=SCHEMA_VERSION,
+        prompt_version=PROMPT_VERSION,
+        models=(primary, fallback),
+    )
+    return primary, fallback, fingerprint
+
+
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_path(path)
 
 
 def _sidecar_path(report_path: Path) -> Path:
@@ -143,93 +152,47 @@ def _normalization_instruction(report_date: str, lines: list[str]) -> dict[str, 
 
 
 def _request_model(model: str, report_date: str, lines: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
-    endpoint = os.environ.get("RD_REPORT_NORMALIZE_LLM_URL", "http://127.0.0.1:4000/v1/messages")
     instruction = _normalization_instruction(report_date, lines)
-    payload = {
-        "model": model,
-        "max_tokens": min(24000, max(6000, len(lines) * 45)),
-        "temperature": 0,
-        "stream": False,
-        "system": (
-            "你是研发历史迁移审计器。你的任务是把旧日报规范化，而不是重写或美化历史。"
-            "原始 Markdown 是唯一事实来源；任何不确定项必须保持未知。"
-        ),
-        "messages": [{"role": "user", "content": json.dumps(instruction, ensure_ascii=False)}],
-    }
-    request = Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-api-key": "local-router",
-                 "anthropic-version": "2023-06-01"},
-        method="POST",
+    parsed, metadata = run_claude_json(
+        model, instruction,
+        prompt=("你是研发历史迁移审计器。原始 Markdown 是唯一事实来源；"
+                "不得把计划、提问或尝试冒充结果，不确定项保持未知。只返回 JSON。"),
+        executable_env="RD_REPORT_NORMALIZE_CLAUDE_BIN",
+        timeout_env="RD_REPORT_NORMALIZE_TIMEOUT", default_timeout=DEFAULT_TIMEOUT,
+        run_context={
+            "home": os.environ.get("RD_COCKPIT_HOME"), "stage": "reports",
+            "source_hash": hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest(),
+            "fallback_used": True,
+            "reason": f"日报 {report_date} 新增或源内容发生变化。",
+        },
     )
-    try:
-        with urlopen(request, timeout=DEFAULT_TIMEOUT) as response:  # noqa: S310 - defaults to localhost router
-            outer = json.load(response)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-    content = outer.get("content") if isinstance(outer, dict) else None
-    text = "".join(
-        str(block.get("text") or "") for block in content or []
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    parsed = _json_object(text)
-    usage = outer.get("usage") if isinstance(outer, dict) and isinstance(outer.get("usage"), dict) else {}
-    return parsed, {"model": model, "usage": usage}
+    return parsed, {"model": model, "usage": metadata.get("usage") or {},
+                    "provider": metadata.get("provider")}
 
 
 def _request_codex_model(
     model_spec: str, report_date: str, lines: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    model_and_effort = model_spec.removeprefix("codex:")
-    model, separator, reasoning = model_and_effort.partition("@")
-    if not separator:
-        reasoning = os.environ.get("RD_REPORT_NORMALIZE_CODEX_REASONING", "medium")
-    executable = resolve_executable("RD_REPORT_NORMALIZE_CODEX_BIN", "codex")
-    timeout = float(os.environ.get("RD_REPORT_NORMALIZE_CODEX_TIMEOUT", str(DEFAULT_TIMEOUT)))
     instruction = _normalization_instruction(report_date, lines)
     prompt = (
         "你是研发历史迁移审计器。原始 Markdown 是唯一事实来源。"
         "请审计标准输入的 JSON，并严格按 output_schema 返回纯 JSON；"
         "不得把计划、提问或尝试冒充结果，不确定项保持未知。"
     )
-    with tempfile.TemporaryDirectory(prefix="rd-history-audit-") as temporary:
-        message_path = Path(temporary) / "last-message.json"
-        command = [
-            executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--skip-git-repo-check", "--sandbox", "read-only", "--model", model,
-            "-c", 'model_provider="openai"',
-            "-c", f'model_reasoning_effort="{reasoning}"',
-            "-C", str(Path(__file__).resolve().parents[1]), "--json",
-            "--output-last-message", str(message_path), prompt,
-        ]
-        try:
-            completed = subprocess.run(
-                command, input=json.dumps(instruction, ensure_ascii=False), capture_output=True,
-                text=True, timeout=timeout, check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"Codex timed out after {timeout:g}s") from exc
-        except OSError as exc:
-            raise RuntimeError(f"could not start Codex: {exc}") from exc
-        if completed.returncode:
-            detail = completed.stderr.strip().splitlines()
-            suffix = f": {detail[-1][:300]}" if detail else ""
-            raise RuntimeError(f"Codex exited with {completed.returncode}{suffix}")
-        try:
-            parsed = _json_object(message_path.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            raise RuntimeError(f"invalid Codex structured output: {exc}") from exc
-        usage: dict[str, Any] = {}
-        for line in completed.stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-                usage = event["usage"]
+    parsed, metadata = run_codex_json(
+        model_spec, instruction, prompt=prompt, executable_env="RD_REPORT_NORMALIZE_CODEX_BIN",
+        timeout_env="RD_REPORT_NORMALIZE_CODEX_TIMEOUT", default_timeout=DEFAULT_TIMEOUT,
+        reasoning_env="RD_REPORT_NORMALIZE_CODEX_REASONING",
+        workdir=Path(__file__).resolve().parents[1], temp_prefix="rd-history-audit-",
+        run_context={
+            "home": os.environ.get("RD_COCKPIT_HOME"), "stage": "reports",
+            "source_hash": hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest(),
+            "reason": f"日报 {report_date} 新增或源内容发生变化。",
+        },
+    )
     return parsed, {"model": model_spec, "usage": {
-        **usage, "provider": "codex-cli", "reasoning_effort": reasoning,
+        **metadata.get("usage", {}), "provider": metadata["provider"],
+        "reasoning_effort": metadata["reasoning_effort"],
     }}
 
 
@@ -363,8 +326,23 @@ def _infer_line_ranges(raw_task: dict[str, Any], lines: list[str]) -> list[tuple
     return ranges[:6]
 
 
+def _plan_lines(lines: list[str]) -> set[int]:
+    """Locate future-plan sections so they cannot substantiate completed work."""
+    current = ""
+    output: set[int] = set()
+    plan_headers = ("明日计划", "下一步", "后续计划", "待办", "todo")
+    for index, raw in enumerate(lines, 1):
+        text = raw.strip()
+        if text.startswith("## "):
+            current = text[3:].strip().casefold()
+        if any(marker in current for marker in plan_headers):
+            output.add(index)
+    return output
+
+
 def _validate_candidate(candidate: dict[str, Any], report_path: Path, lines: list[str]) -> dict[str, Any]:
     from .daily_source import _detail_project_ids, _enhanced_title, _project_ids, project_display_names
+    from .daily_audit import _numbers
 
     if not isinstance(candidate.get("groups"), list):
         raise ValueError("normalization output is missing groups")
@@ -372,6 +350,8 @@ def _validate_candidate(candidate: dict[str, Any], report_path: Path, lines: lis
     groups: list[dict[str, Any]] = []
     all_project_ids: list[str] = []
     unsupported_tasks = 0
+    rejected_tasks: list[str] = []
+    future_lines = _plan_lines(lines)
     for raw_group in candidate["groups"]:
         if not isinstance(raw_group, dict):
             continue
@@ -392,6 +372,26 @@ def _validate_candidate(candidate: dict[str, Any], report_path: Path, lines: lis
                 f"{report_path.name}:L{start}" if start == end else f"{report_path.name}:L{start}-L{end}"
                 for start, end in ranges
             ]
+            cited_line_numbers = {
+                number for start, end in ranges for number in range(start, end + 1)
+            }
+            cited_text = "\n".join(
+                lines[number - 1] for number in sorted(cited_line_numbers)
+            )
+            factual_fields = [
+                *_strings(raw_task.get("did")), *_strings(raw_task.get("results")),
+                *_strings(raw_task.get("conclusions")),
+            ]
+            if evidence and factual_fields and cited_line_numbers and cited_line_numbers <= future_lines:
+                rejected_tasks.append(f"{task_title}：完成性描述仅引用了计划段落")
+                continue
+            claimed_numbers = _numbers([task_title, *factual_fields])
+            unsupported_numbers = sorted(number for number in claimed_numbers if number not in cited_text)
+            if evidence and unsupported_numbers:
+                rejected_tasks.append(
+                    f"{task_title}：数字缺少原文证据（{', '.join(unsupported_numbers)}）",
+                )
+                continue
             task_ids = [value for value in _strings(raw_task.get("project_ids"))
                         if value in allowed and value != "unassigned"]
             task_text = " ".join([
@@ -435,6 +435,7 @@ def _validate_candidate(candidate: dict[str, Any], report_path: Path, lines: lis
     data_quality = _strings(candidate.get("data_quality"))
     if unsupported_tasks:
         data_quality.append(f"{unsupported_tasks} 个历史任务没有可用原文行号证据，按 inferred 展示。")
+    data_quality.extend(f"已移除不受原文支持的任务：{reason}" for reason in rejected_tasks)
     return {
         "day_summary": str(candidate.get("day_summary") or "").strip(),
         "no_activity": explicit_no_activity,
@@ -448,6 +449,56 @@ def _validate_candidate(candidate: dict[str, Any], report_path: Path, lines: lis
         "task_count": sum(len(group["tasks"]) for group in groups),
         "project_ids": list(dict.fromkeys(all_project_ids)),
     }
+
+
+def _legacy_evidence_ranges(value: Any, report_name: str) -> list[list[int]]:
+    ranges: list[list[int]] = []
+    pattern = re.compile(rf"^(?:{re.escape(report_name)}:)?L(\d+)(?:-L(\d+))?$")
+    for item in value if isinstance(value, list) else []:
+        match = pattern.fullmatch(str(item).strip())
+        if match:
+            ranges.append([int(match.group(1)), int(match.group(2) or match.group(1))])
+    return ranges
+
+
+def _upgrade_legacy_sidecar(report_path: Path, value: dict[str, Any]) -> dict[str, Any] | None:
+    """Revalidate an older accepted cache without spending another model call."""
+    if value.get("source_sha256") != _sha256(report_path):
+        return None
+    primary, fallback, policy = _model_policy()
+    selected = str((value.get("model_run") or {}).get("selected_model") or "")
+    if selected not in {primary, fallback}:
+        return None
+    candidate = copy.deepcopy(value)
+    for group in candidate.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for task in group.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            task["evidence_lines"] = _legacy_evidence_ranges(
+                task.get("evidence"), report_path.name,
+            )
+    lines = report_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    try:
+        normalized = _validate_candidate(candidate, report_path, lines)
+    except ValueError:
+        return None
+    upgraded = {
+        "schema_version": SCHEMA_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "policy_fingerprint": policy,
+        "report_date": report_path.stem,
+        "source_path": str(report_path),
+        "source_sha256": value["source_sha256"],
+        "generated_at": value.get("generated_at"),
+        "revalidated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cache_migration": {"from_schema": value.get("schema_version"), "model_call": False},
+        "model_run": value.get("model_run") or {},
+        **normalized,
+    }
+    atomic_write_json(_sidecar_path(report_path), upgraded)
+    return upgraded
 
 
 def load_normalized(report_path: Path) -> dict[str, Any] | None:
@@ -464,9 +515,24 @@ def load_normalized(report_path: Path) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
         return None
+    _, _, expected_policy = _model_policy()
+    if value.get("prompt_version") != PROMPT_VERSION or value.get("policy_fingerprint") != expected_policy:
+        return None
     if value.get("source_sha256") != _sha256(report_path):
         return None
     return value
+
+
+def load_or_upgrade_normalized(report_path: Path) -> dict[str, Any] | None:
+    current = load_normalized(report_path)
+    if current is not None or _has_validated_audit(report_path):
+        return current
+    sidecar = _sidecar_path(report_path)
+    try:
+        value = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _upgrade_legacy_sidecar(report_path, value) if isinstance(value, dict) else None
 
 
 def normalize_report(
@@ -483,13 +549,12 @@ def normalize_report(
             "path": str(_validated_audit_path(report_path)),
             "model": None,
         }
-    if not force and (cached := load_normalized(report_path)):
+    if not force and (cached := load_or_upgrade_normalized(report_path)):
         return {"date": report_path.stem, "status": "cached", "path": str(_sidecar_path(report_path)),
                 "model": (cached.get("model_run") or {}).get("selected_model")}
     lines = report_path.read_text(encoding="utf-8", errors="replace").splitlines()
     source_hash = _sha256(report_path)
-    primary = os.environ.get("RD_REPORT_NORMALIZE_MODEL", MODEL_PRIMARY).strip()
-    fallback = os.environ.get("RD_REPORT_NORMALIZE_FALLBACK_MODEL", MODEL_FALLBACK).strip()
+    primary, fallback, policy = _model_policy()
     models = list(dict.fromkeys(value for value in (primary, fallback) if value))
     request_model = requester or _request_any_model
     attempts: list[dict[str, Any]] = []
@@ -509,6 +574,8 @@ def normalize_report(
         raise RuntimeError(f"all normalization models failed for {report_path.name}: {attempts}")
     value = {
         "schema_version": SCHEMA_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "policy_fingerprint": policy,
         "report_date": report_path.stem,
         "source_path": str(report_path),
         "source_sha256": source_hash,
@@ -519,11 +586,8 @@ def normalize_report(
         **normalized,
     }
     sidecar = _sidecar_path(report_path)
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
     archived = _archive_deepseek_sidecar(sidecar) if force and sidecar.exists() else None
-    temporary = sidecar.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, sidecar)
+    atomic_write_json(sidecar, value)
     return {"date": report_path.stem, "status": "generated", "path": str(sidecar),
             "model": selected, "tasks": normalized["task_count"],
             "archived": str(archived) if archived else None}
