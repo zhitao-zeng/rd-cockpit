@@ -30,6 +30,15 @@ def _report(day: str = "2026-08-01") -> str:
 """
 
 
+def _configure_projects(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "projects.yaml"
+    config.write_text(
+        "projects:\n  asr:\n    name: ASR\n  ocr:\n    name: OCR\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RD_PROJECTS_CONFIG", str(config))
+
+
 def test_daily_parser_accepts_confidence_qualified_result_field(tmp_path: Path) -> None:
     path = tmp_path / "2026-08-01.md"
     path.write_text(_report(), encoding="utf-8")
@@ -39,7 +48,10 @@ def test_daily_parser_accepts_confidence_qualified_result_field(tmp_path: Path) 
     assert task["results"] == ["TensorRT 延迟 47ms，MNN 延迟 82ms；测试集为 waic-v2。"]
 
 
-def test_experiment_validator_keeps_readable_evidence_bound_record(tmp_path: Path) -> None:
+def test_experiment_validator_keeps_readable_evidence_bound_record(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _configure_projects(tmp_path, monkeypatch)
     path = tmp_path / "2026-08-01.md"
     path.write_text(_report(), encoding="utf-8")
     record = _record(path)
@@ -63,7 +75,10 @@ def test_experiment_validator_keeps_readable_evidence_bound_record(tmp_path: Pat
     assert result["experiments"][0]["metrics"][0]["value"] == "47"
 
 
-def test_experiment_validator_rejects_unsupported_metric_and_cross_project(tmp_path: Path) -> None:
+def test_experiment_validator_rejects_unsupported_metric_and_cross_project(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _configure_projects(tmp_path, monkeypatch)
     path = tmp_path / "2026-08-01.md"
     path.write_text(_report(), encoding="utf-8")
     record = _record(path)
@@ -85,6 +100,7 @@ def test_experiment_validator_rejects_unsupported_metric_and_cross_project(tmp_p
 
 
 def test_backfill_is_cached_and_api_reads_without_model_calls(tmp_path: Path, monkeypatch) -> None:
+    _configure_projects(tmp_path, monkeypatch)
     path = tmp_path / "2026-08-01.md"
     path.write_text(_report(), encoding="utf-8")
     calls: list[str] = []
@@ -135,6 +151,7 @@ def test_usage_pool_differences_cumulative_long_session_counters(tmp_path: Path)
 
 
 def test_fallback_sidecar_is_retried_by_primary_model(tmp_path: Path, monkeypatch) -> None:
+    _configure_projects(tmp_path, monkeypatch)
     path = tmp_path / "2026-08-01.md"
     path.write_text(_report(), encoding="utf-8")
     attempts: list[str] = []
@@ -160,6 +177,7 @@ def test_fallback_sidecar_is_retried_by_primary_model(tmp_path: Path, monkeypatc
 def test_read_only_experiment_api_returns_sidecar_and_rejects_unknown_project(
     tmp_path: Path, monkeypatch,
 ) -> None:
+    _configure_projects(tmp_path, monkeypatch)
     reports = tmp_path / "reports"
     reports.mkdir()
     (reports / "2026-08-01.md").write_text(_report(), encoding="utf-8")
